@@ -1,0 +1,81 @@
+bundle:
+  name: me-engineering-assistant
+
+variables:
+  llm_endpoint:
+    description: Databricks serving endpoint used for fallback LLM generation.
+    default: ""
+  embedding_endpoint:
+    description: Databricks serving endpoint used for LangChain FAISS embeddings.
+    default: ""
+  spark_version:
+    description: Runtime for validation and model logging jobs.
+    default: "15.4.x-scala2.12"
+  node_type_id:
+    description: Override this for the target cloud/workspace if needed.
+    default: "i3.xlarge"
+  experiment_name:
+    description: MLflow experiment path.
+    default: "/Shared/me-engineering-assistant"
+  registered_model_name:
+    description: Optional Unity Catalog or workspace model name.
+    default: ""
+
+artifacts:
+  python_package:
+    type: whl
+    path: .
+    build: python -m pip install build && python -m build
+
+resources:
+  jobs:
+    me_engineering_assistant_build_and_log:
+      name: me-engineering-assistant-build-and-log
+      job_clusters:
+        - job_cluster_key: python_cluster
+          new_cluster:
+            spark_version: ${var.spark_version}
+            node_type_id: ${var.node_type_id}
+            num_workers: 1
+            spark_env_vars:
+              DATABRICKS_LLM_ENDPOINT: ${var.llm_endpoint}
+              DATABRICKS_EMBEDDING_ENDPOINT: ${var.embedding_endpoint}
+      tasks:
+        - task_key: validate_agent
+          job_cluster_key: python_cluster
+          python_wheel_task:
+            package_name: me_engineering_assistant
+            entry_point: me_validate
+            parameters:
+              - --docs-dir
+              - ${workspace.file_path}
+              - --questions
+              - ${workspace.file_path}/test-questions.csv
+              - --min-accuracy
+              - "0.8"
+          libraries:
+            - whl: ./dist/*.whl
+        - task_key: log_mlflow_model
+          depends_on:
+            - task_key: validate_agent
+          job_cluster_key: python_cluster
+          python_wheel_task:
+            package_name: me_engineering_assistant
+            entry_point: me_log_model
+            parameters:
+              - --docs-dir
+              - ${workspace.file_path}
+              - --questions
+              - ${workspace.file_path}/test-questions.csv
+              - --experiment-name
+              - ${var.experiment_name}
+          libraries:
+            - whl: ./dist/*.whl
+
+targets:
+  dev:
+    mode: development
+    default: true
+    workspace:
+      root_path: ~/.bundle/${bundle.name}/${bundle.target}
+

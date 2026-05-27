@@ -1,0 +1,71 @@
+[build-system]
+requires = ["setuptools>=69", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "me-engineering-assistant"
+version = "0.1.0"
+description = "LangGraph RAG assistant for ME ECU engineering specifications."
+readme = "README.md"
+requires-python = ">=3.10"
+authors = [{ name = "ME Engineering" }]
+dependencies = []
+
+[project.optional-dependencies]
+local = [
+  "faiss-cpu>=1.8; python_version < '3.14'",
+  "sentence-transformers>=3.0; python_version < '3.14'",
+]
+eval = [
+  "mlflow>=2.13",
+]
+mcp = [
+  "mcp>=1.27",
+]
+databricks = [
+  "mlflow>=2.13",
+  "langchain>=0.2",
+  "langchain-community>=0.2",
+  "langchain-databricks>=0.1",
+  "langgraph>=0.2",
+  "pandas>=2.0",
+  "faiss-cpu>=1.8; python_version < '3.14'",
+]
+dev = [
+  "pytest>=8",
+  "pylint>=3",
+]
+
+[project.scripts]
+me_assistant = "me_engineering_assistant.cli:main"
+me_evaluate = "me_engineering_assistant.evaluate:main"
+me_validate = "me_engineering_assistant.validate:main"
+me_log_model = "me_engineering_assistant.log_model:main"
+me_mcp_server = "me_engineering_assistant.mcp_server:main"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.pylint.main]
+py-version = "3.10"
+source-roots = ["src"]
+
+[tool.pylint.messages_control]
+disable = [
+  "duplicate-code",
+  "import-outside-toplevel",
+  "line-too-long",
+  "missing-module-docstring",
+  "missing-class-docstring",
+  "missing-function-docstring",
+  "no-value-for-parameter",
+  "too-few-public-methods",
+  "too-many-arguments",
+  "too-many-branches",
+  "too-many-instance-attributes",
+  "too-many-locals",
+  "too-many-return-statements",
+  "too-many-statements",
+  "trailing-newlines",
+  "unused-argument",
+]
