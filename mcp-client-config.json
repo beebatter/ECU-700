@@ -6,12 +6,10 @@
         "-m",
         "me_engineering_assistant.mcp_server",
         "--docs-dir",
-        "/Users/easkwon/Downloads/ECU-700",
-        "--no-langchain"
+        "/Users/easkwon/Downloads/ECU-700"
       ],
       "env": {
         "PYTHONPATH": "/Users/easkwon/Downloads/ECU-700/src",
-        "ME_RETRIEVER_BACKEND": "keyword",
         "ME_USE_LLM_PLANNER": "false",
         "ME_USE_LLM_ANSWER": "false",
         "ME_FORCE_LLM": "false"

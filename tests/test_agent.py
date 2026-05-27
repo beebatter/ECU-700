@@ -19,8 +19,7 @@ class AgentTests(unittest.TestCase):
         os.environ["ME_USE_LLM_PLANNER"] = "false"
         os.environ["ME_USE_LLM_ANSWER"] = "false"
         os.environ["ME_FORCE_LLM"] = "false"
-        os.environ["ME_RETRIEVER_BACKEND"] = "keyword"
-        cls.agent = ECUAgent(docs_dir=ROOT, prefer_langchain=False)
+        cls.agent = ECUAgent(docs_dir=ROOT)
 
     def test_routes_single_model_queries(self) -> None:
         self.assertEqual(route_query("How much RAM does the ECU-850 have?").models, ["ECU-850"])

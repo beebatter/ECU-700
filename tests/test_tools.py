@@ -20,7 +20,7 @@ class ToolTests(unittest.TestCase):
         docs = load_source_documents(base_path=ROOT)
         cls.toolbox = ECUToolbox(
             extract_specs(docs),
-            InMemoryECURetriever(chunk_documents(docs), prefer_langchain=False),
+            InMemoryECURetriever(chunk_documents(docs)),
         )
 
     def test_tool_manifest_exposes_function_calls(self) -> None:

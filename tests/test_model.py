@@ -18,7 +18,6 @@ class ModelTests(unittest.TestCase):
         os.environ["ME_USE_LLM_PLANNER"] = "false"
         os.environ["ME_USE_LLM_ANSWER"] = "false"
         os.environ["ME_FORCE_LLM"] = "false"
-        os.environ["ME_RETRIEVER_BACKEND"] = "keyword"
 
     def test_predict_accepts_single_string(self) -> None:
         model = ECUAssistantPyFunc(docs_dir=str(ROOT))

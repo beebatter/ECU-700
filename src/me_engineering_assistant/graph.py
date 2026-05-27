@@ -110,18 +110,12 @@ class ECUAgent:
     def __init__(
         self,
         docs_dir: str | Path | None = None,
-        prefer_langchain: bool = True,
-        embedding_endpoint: str | None = None,
     ) -> None:
         self.docs_dir = Path(docs_dir).expanduser().resolve() if docs_dir else None
         self.documents = load_source_documents(base_path=self.docs_dir)
         self.chunks = chunk_documents(self.documents)
         self.specs: dict[str, ECUSpec] = extract_specs(self.documents)
-        self.retriever = InMemoryECURetriever(
-            self.chunks,
-            prefer_langchain=prefer_langchain,
-            embedding_endpoint=embedding_endpoint,
-        )
+        self.retriever = InMemoryECURetriever(self.chunks)
         self.toolbox = ECUToolbox(self.specs, self.retriever)
         self._workflow = self._build_langgraph_workflow()
 

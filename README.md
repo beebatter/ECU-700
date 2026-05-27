@@ -4,7 +4,7 @@ This project implements the ECU engineering coding challenge as a small Python
 package instead of a notebook. It provides a LangGraph-style RAG agent that can
 route questions across the ECU-700 and ECU-800 Markdown specifications, return
 answers with sources, validate against the supplied golden questions, and run
-locally with optional DeepSeek LLM generation and local embedding retrieval.
+locally with optional DeepSeek LLM generation and local FAISS retrieval.
 
 ## Architecture
 
@@ -15,10 +15,9 @@ The runtime flow is:
 - `documents.py` loads the three Markdown documents and chunks by headings and
   paragraphs. It intentionally does not depend on strict Markdown table parsing,
   because the ECU-700 CAN row is malformed in the source file.
-- `retriever.py` provides a deterministic in-memory TF-IDF retriever and can
-  attach a local `sentence-transformers` + FAISS backend when those packages are
-  installed. A Databricks/LangChain FAISS backend is still available as an
-  optional compatibility path.
+- `retriever.py` uses one retrieval path: `sentence-transformers` creates
+  normalized embeddings and FAISS performs in-memory inner-product similarity
+  search over the document chunks.
 - `graph.py` builds the four-node LangGraph workflow when `langgraph` is
   installed. The same node functions run locally without LangGraph so the
   package remains testable in lightweight environments.
@@ -66,8 +65,8 @@ Run the unit tests:
 PYTHONPATH=src python3 -m unittest discover -s tests -v
 ```
 
-The local implementation has no mandatory third-party dependency. For local LLM
-configuration, copy `.env.example` to `.env` and fill in your own key:
+The local retriever requires `sentence-transformers` and `faiss-cpu`. For local
+LLM configuration, copy `.env.example` to `.env` and fill in your own key:
 
 ```bash
 cp .env.example .env
@@ -122,8 +121,7 @@ Run the server over stdio, which is the usual local MCP transport:
 
 ```bash
 PYTHONPATH=src python -m me_engineering_assistant.mcp_server \
-  --docs-dir . \
-  --no-langchain
+  --docs-dir .
 ```
 
 The server exposes these MCP tools:
@@ -154,16 +152,14 @@ Client configuration examples are included in:
 - `mcp-client-config.json` for clients that accept an `mcpServers` JSON block;
 - `.cursor/mcp.json` for Cursor-style project-local MCP configuration.
 
-For a fuller local RAG stack on Python 3.10-3.13, install the local embedding
-extra:
+Install local development dependencies with:
 
 ```bash
-python -m pip install -e ".[local,dev]"
+python -m pip install -e ".[dev,mcp]"
 ```
 
-On Python 3.14, many embedding dependencies may not have wheels yet, so the
-project will keep using the deterministic in-memory retriever until you switch
-to a supported Python version.
+The package targets Python 3.10-3.13 because the local FAISS and
+sentence-transformers stack is the only supported retrieval path.
 
 For the full Databricks/LangChain/MLflow environment, install:
 
@@ -179,8 +175,7 @@ Configure the bundle target and endpoint variables, then deploy and run:
 databricks bundle validate
 databricks bundle deploy -t dev
 databricks bundle run me_engineering_assistant_build_and_log -t dev \
-  --var llm_endpoint=<your-llm-serving-endpoint> \
-  --var embedding_endpoint=<your-embedding-serving-endpoint>
+  --var llm_endpoint=<your-llm-serving-endpoint>
 ```
 
 If your workspace uses a different cloud node type, override `node_type_id`:

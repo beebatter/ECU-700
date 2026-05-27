@@ -28,7 +28,6 @@ class MCPServerTests(unittest.TestCase):
         env = {
             **os.environ,
             "PYTHONPATH": str(ROOT / "src"),
-            "ME_RETRIEVER_BACKEND": "keyword",
             "ME_USE_LLM_PLANNER": "false",
             "ME_USE_LLM_ANSWER": "false",
             "ME_FORCE_LLM": "false",
@@ -40,7 +39,6 @@ class MCPServerTests(unittest.TestCase):
                 "me_engineering_assistant.mcp_server",
                 "--docs-dir",
                 str(ROOT),
-                "--no-langchain",
             ],
             env=env,
         )

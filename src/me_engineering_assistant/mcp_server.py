@@ -14,7 +14,6 @@ SERVER_NAME = "me-ecu-engineering-assistant"
 def create_mcp_server(
     docs_dir: str | Path | None = None,
     *,
-    prefer_langchain: bool = True,
     host: str = "127.0.0.1",
     port: int = 8000,
 ):
@@ -24,7 +23,7 @@ def create_mcp_server(
     except ImportError as exc:
         raise RuntimeError("Install the MCP extra first: python -m pip install -e '.[mcp]'") from exc
 
-    agent = ECUAgent(docs_dir=docs_dir, prefer_langchain=prefer_langchain)
+    agent = ECUAgent(docs_dir=docs_dir)
     toolbox = agent.toolbox
     documents_by_source = {document.metadata["source"]: document.text for document in agent.documents}
     server = FastMCP(
@@ -89,16 +88,10 @@ def main(argv: Sequence[str] | None = None) -> int:
     )
     parser.add_argument("--host", default="127.0.0.1", help="Host for HTTP transports.")
     parser.add_argument("--port", type=int, default=8000, help="Port for HTTP transports.")
-    parser.add_argument(
-        "--no-langchain",
-        action="store_true",
-        help="Disable optional embedding backends and use the deterministic keyword retriever.",
-    )
     args = parser.parse_args(argv)
 
     server = create_mcp_server(
         docs_dir=args.docs_dir,
-        prefer_langchain=not args.no_langchain,
         host=args.host,
         port=args.port,
     )

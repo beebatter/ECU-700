@@ -5,9 +5,6 @@ variables:
   llm_endpoint:
     description: Databricks serving endpoint used for fallback LLM generation.
     default: ""
-  embedding_endpoint:
-    description: Databricks serving endpoint used for LangChain FAISS embeddings.
-    default: ""
   spark_version:
     description: Runtime for validation and model logging jobs.
     default: "15.4.x-scala2.12"
@@ -39,7 +36,6 @@ resources:
             num_workers: 1
             spark_env_vars:
               DATABRICKS_LLM_ENDPOINT: ${var.llm_endpoint}
-              DATABRICKS_EMBEDDING_ENDPOINT: ${var.embedding_endpoint}
       tasks:
         - task_key: validate_agent
           job_cluster_key: python_cluster
@@ -78,4 +74,3 @@ targets:
     default: true
     workspace:
       root_path: ~/.bundle/${bundle.name}/${bundle.target}
-

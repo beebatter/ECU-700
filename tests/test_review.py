@@ -21,7 +21,6 @@ class ReviewQueueTests(unittest.TestCase):
             "ME_HITL_ENABLED",
             "ME_HITL_CONFIDENCE_THRESHOLD",
             "ME_REVIEW_QUEUE_PATH",
-            "ME_RETRIEVER_BACKEND",
             "ME_USE_LLM_PLANNER",
             "ME_USE_LLM_ANSWER",
             "ME_FORCE_LLM",
@@ -34,7 +33,6 @@ class ReviewQueueTests(unittest.TestCase):
                 os.environ["ME_HITL_ENABLED"] = "true"
                 os.environ["ME_HITL_CONFIDENCE_THRESHOLD"] = "0.75"
                 os.environ["ME_REVIEW_QUEUE_PATH"] = str(queue_path)
-                os.environ["ME_RETRIEVER_BACKEND"] = "keyword"
                 os.environ["ME_USE_LLM_PLANNER"] = "false"
                 os.environ["ME_USE_LLM_ANSWER"] = "false"
                 os.environ["ME_FORCE_LLM"] = "false"

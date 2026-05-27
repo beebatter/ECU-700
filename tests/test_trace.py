@@ -16,11 +16,10 @@ from me_engineering_assistant.visualization import trace_to_markdown, trace_to_m
 class TraceTests(unittest.TestCase):
     @classmethod
     def setUpClass(cls) -> None:
-        os.environ["ME_RETRIEVER_BACKEND"] = "keyword"
         os.environ["ME_USE_LLM_PLANNER"] = "false"
         os.environ["ME_USE_LLM_ANSWER"] = "false"
         os.environ["ME_FORCE_LLM"] = "false"
-        cls.agent = ECUAgent(docs_dir=ROOT, prefer_langchain=False)
+        cls.agent = ECUAgent(docs_dir=ROOT)
 
     def test_agent_response_can_include_plan_trace(self) -> None:
         response = self.agent.answer("Compare the CAN bus capabilities of ECU-750 and ECU-850.", include_trace=True)
