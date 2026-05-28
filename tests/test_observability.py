@@ -11,6 +11,7 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "src"))
 
+# pylint: disable=wrong-import-position
 from me_engineering_assistant.graph import ECUAgent
 from me_engineering_assistant.observability import load_log_records, summarize_log_records
 

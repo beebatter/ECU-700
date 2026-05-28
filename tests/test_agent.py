@@ -9,6 +9,7 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "src"))
 
+# pylint: disable=wrong-import-position
 from me_engineering_assistant.evaluate import evaluate_golden, load_questions
 from me_engineering_assistant.graph import ECUAgent, route_query
 
@@ -25,6 +26,7 @@ class AgentTests(unittest.TestCase):
         self.assertEqual(route_query("How much RAM does the ECU-850 have?").models, ["ECU-850"])
         self.assertEqual(route_query("What are the AI capabilities of the ECU-850b?").models, ["ECU-850b"])
         self.assertEqual(route_query("What is the max temp for ECU-750?").models, ["ECU-750"])
+        self.assertEqual(route_query("请你为我介绍一下ECU-700这个型号").models, ["ECU-750"])
 
     def test_routes_comparison_queries_to_multiple_sources(self) -> None:
         route = route_query("Compare the CAN bus capabilities of ECU-750 and ECU-850.")

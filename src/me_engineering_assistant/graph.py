@@ -8,7 +8,6 @@ from typing import Any, Mapping, Sequence, TypedDict
 
 from me_engineering_assistant.answering import AnswerDraft, generate_answer, models_in_query
 from me_engineering_assistant.documents import chunk_documents, load_source_documents
-from me_engineering_assistant.knowledge import ECUSpec, extract_specs
 from me_engineering_assistant.observability import log_agent_response
 from me_engineering_assistant.review import maybe_enqueue_review
 from me_engineering_assistant.retriever import InMemoryECURetriever, RetrievalResult
@@ -116,9 +115,8 @@ class ECUAgent:
         self.docs_dir = Path(docs_dir).expanduser().resolve() if docs_dir else None
         self.documents = load_source_documents(base_path=self.docs_dir)
         self.chunks = chunk_documents(self.documents)
-        self.specs: dict[str, ECUSpec] = extract_specs(self.documents)
         self.retriever = InMemoryECURetriever(self.chunks)
-        self.toolbox = ECUToolbox(self.specs, self.retriever)
+        self.toolbox = ECUToolbox(self.retriever)
         self._workflow = self._build_langgraph_workflow()
 
     def answer(self, query: str, include_trace: bool = False) -> AgentResponse:

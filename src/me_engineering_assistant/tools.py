@@ -1,26 +1,10 @@
 from __future__ import annotations
 
 from dataclasses import asdict, dataclass
-from typing import Any, Mapping, Sequence
+from math import ceil
+from typing import Any, Sequence
 
-from me_engineering_assistant.knowledge import ECUSpec
 from me_engineering_assistant.retriever import InMemoryECURetriever, RetrievalResult
-
-
-SPEC_FIELDS = (
-    "processor",
-    "memory_ram",
-    "storage",
-    "can_interface",
-    "ethernet",
-    "power_consumption",
-    "operating_temperature",
-    "connectors",
-    "npu",
-    "ota_supported",
-    "npu_enable_command",
-    "safety",
-)
 
 
 @dataclass(frozen=True)
@@ -41,49 +25,30 @@ class ToolResult:
 
 
 class ECUToolbox:
-    def __init__(self, specs: Mapping[str, ECUSpec], retriever: InMemoryECURetriever) -> None:
-        self.specs = dict(specs)
+    """Small RAG toolbox shared by the local agent and MCP server."""
+
+    def __init__(self, retriever: InMemoryECURetriever) -> None:
         self.retriever = retriever
 
     def manifest(self) -> list[dict[str, Any]]:
         return [
             {
                 "name": "search_documents",
-                "description": "Search ECU markdown documentation chunks for evidence.",
+                "description": "Search ECU markdown documentation chunks for grounding evidence.",
                 "input_schema": {
                     "type": "object",
                     "properties": {
                         "query": {"type": "string"},
                         "models": {"type": "array", "items": {"type": "string"}},
-                        "top_k": {"type": "integer", "minimum": 1, "maximum": 8},
+                        "sources": {"type": "array", "items": {"type": "string"}},
+                        "top_k": {"type": "integer", "minimum": 1, "maximum": 10},
                     },
                     "required": ["query"],
                 },
             },
             {
-                "name": "read_model_spec",
-                "description": "Read extracted specifications for one ECU model.",
-                "input_schema": {
-                    "type": "object",
-                    "properties": {"model": {"type": "string"}},
-                    "required": ["model"],
-                },
-            },
-            {
-                "name": "compare_model_specs",
-                "description": "Compare selected specification fields across ECU models.",
-                "input_schema": {
-                    "type": "object",
-                    "properties": {
-                        "models": {"type": "array", "items": {"type": "string"}},
-                        "fields": {"type": "array", "items": {"type": "string"}},
-                    },
-                    "required": ["models"],
-                },
-            },
-            {
-                "name": "list_models",
-                "description": "List ECU models currently available in the internal documentation.",
+                "name": "list_sources",
+                "description": "List source documents currently available to the RAG retriever.",
                 "input_schema": {"type": "object", "properties": {}},
             },
         ]
@@ -91,12 +56,8 @@ class ECUToolbox:
     def execute(self, call: ToolCall) -> ToolResult:
         if call.name == "search_documents":
             return self.search_documents(**call.arguments)
-        if call.name == "read_model_spec":
-            return self.read_model_spec(**call.arguments)
-        if call.name == "compare_model_specs":
-            return self.compare_model_specs(**call.arguments)
-        if call.name == "list_models":
-            return self.list_models()
+        if call.name == "list_sources":
+            return self.list_sources()
         return ToolResult(
             name=call.name,
             arguments=call.arguments,
@@ -108,10 +69,19 @@ class ECUToolbox:
         self,
         query: str,
         models: Sequence[str] | None = None,
-        top_k: int = 4,
+        sources: Sequence[str] | None = None,
+        top_k: int = 6,
     ) -> ToolResult:
-        filters = {"models": list(models)} if models else None
-        results = self.retriever.retrieve(query, filters=filters, top_k=top_k)
+        filters = {}
+        if models:
+            filters["models"] = list(models)
+        if sources:
+            filters["sources"] = list(sources)
+
+        if models and len(models) > 1:
+            results = self._retrieve_diverse_by_model(query=query, models=models, top_k=top_k)
+        else:
+            results = self.retriever.retrieve(query, filters=filters or None, top_k=top_k)
         payload = [
             {
                 "content": result.content,
@@ -122,118 +92,60 @@ class ECUToolbox:
         ]
         return ToolResult(
             name="search_documents",
-            arguments={"query": query, "models": list(models or ()), "top_k": top_k},
+            arguments={
+                "query": query,
+                "models": list(models or ()),
+                "sources": list(sources or ()),
+                "top_k": top_k,
+            },
             result=payload,
             sources=_unique_sources(result.metadata.get("source") for result in results),
         )
 
-    def read_model_spec(self, model: str) -> ToolResult:
-        spec = self.specs.get(normalize_model_name(model))
-        if spec is None:
-            return ToolResult(
-                name="read_model_spec",
-                arguments={"model": model},
-                result={"error": f"No specification found for {model}"},
-                sources=[],
+    def list_sources(self) -> ToolResult:
+        rows_by_source: dict[str, dict[str, str]] = {}
+        for chunk in self.retriever.chunks:
+            source = chunk.metadata.get("source", "unknown")
+            rows_by_source.setdefault(
+                source,
+                {
+                    "source": source,
+                    "model": chunk.metadata.get("model", "unknown"),
+                    "series": chunk.metadata.get("series", "unknown"),
+                    "title": chunk.metadata.get("title", source),
+                },
             )
+        rows = sorted(rows_by_source.values(), key=lambda row: row["source"])
         return ToolResult(
-            name="read_model_spec",
-            arguments={"model": spec.model},
-            result=spec_to_dict(spec),
-            sources=[spec.source],
-        )
-
-    def compare_model_specs(
-        self,
-        models: Sequence[str],
-        fields: Sequence[str] | None = None,
-    ) -> ToolResult:
-        normalized_models = [normalize_model_name(model) for model in models]
-        selected_fields = normalize_fields(fields or SPEC_FIELDS)
-        rows: list[dict[str, Any]] = []
-        sources: list[str] = []
-        for model in normalized_models:
-            spec = self.specs.get(model)
-            if spec is None:
-                rows.append({"model": model, "error": "No specification found"})
-                continue
-            spec_dict = spec_to_dict(spec)
-            row = {"model": spec.model, "series": spec.series, "source": spec.source}
-            for field in selected_fields:
-                row[field] = spec_dict.get(field)
-            rows.append(row)
-            sources.append(spec.source)
-        return ToolResult(
-            name="compare_model_specs",
-            arguments={"models": normalized_models, "fields": selected_fields},
-            result=rows,
-            sources=_unique_sources(sources),
-        )
-
-    def list_models(self) -> ToolResult:
-        rows = [
-            {"model": spec.model, "series": spec.series, "source": spec.source}
-            for spec in self.specs.values()
-        ]
-        return ToolResult(
-            name="list_models",
+            name="list_sources",
             arguments={},
             result=rows,
-            sources=_unique_sources(spec.source for spec in self.specs.values()),
+            sources=[row["source"] for row in rows],
         )
 
+    def _retrieve_diverse_by_model(
+        self,
+        *,
+        query: str,
+        models: Sequence[str],
+        top_k: int,
+    ) -> list[RetrievalResult]:
+        per_model = max(2, ceil(top_k / len(models)))
+        candidates: list[RetrievalResult] = []
+        for model in models:
+            candidates.extend(self.retriever.retrieve(query, filters={"models": [model]}, top_k=per_model))
 
-def normalize_model_name(model: str) -> str:
-    lowered = model.lower().replace(" ", "-")
-    if "750" in lowered or "700" in lowered:
-        return "ECU-750"
-    if "850b" in lowered or "800b" in lowered:
-        return "ECU-850b"
-    if "850" in lowered or "800a" in lowered or "800" in lowered:
-        return "ECU-850"
-    return model
-
-
-def normalize_fields(fields: Sequence[str]) -> list[str]:
-    normalized: list[str] = []
-    for field in fields:
-        clean = field.lower().strip().replace(" ", "_").replace(".", "")
-        aliases = {
-            "ram": "memory_ram",
-            "memory": "memory_ram",
-            "temperature": "operating_temperature",
-            "operating_temp": "operating_temperature",
-            "can": "can_interface",
-            "can_bus": "can_interface",
-            "power": "power_consumption",
-            "ota": "ota_supported",
-            "ai": "npu",
-            "command": "npu_enable_command",
-        }
-        value = aliases.get(clean, clean)
-        if value in SPEC_FIELDS and value not in normalized:
-            normalized.append(value)
-    return normalized or list(SPEC_FIELDS)
-
-
-def spec_to_dict(spec: ECUSpec) -> dict[str, Any]:
-    return {
-        "model": spec.model,
-        "series": spec.series,
-        "source": spec.source,
-        "processor": spec.processor,
-        "memory_ram": spec.memory_ram,
-        "storage": spec.storage,
-        "can_interface": spec.can_interface,
-        "ethernet": spec.ethernet,
-        "power_consumption": spec.power_consumption,
-        "operating_temperature": spec.operating_temperature,
-        "connectors": spec.connectors,
-        "npu": spec.npu,
-        "ota_supported": spec.ota_supported,
-        "npu_enable_command": spec.npu_enable_command,
-        "safety": spec.safety,
-    }
+        seen: set[tuple[str, str]] = set()
+        deduped: list[RetrievalResult] = []
+        for result in sorted(candidates, key=lambda item: item.score, reverse=True):
+            key = (result.metadata.get("source", ""), result.content)
+            if key in seen:
+                continue
+            seen.add(key)
+            deduped.append(result)
+            if len(deduped) >= top_k:
+                break
+        return deduped
 
 
 def retrieval_results_from_tool(result: ToolResult) -> list[RetrievalResult]:

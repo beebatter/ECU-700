@@ -8,9 +8,9 @@ locally with optional DeepSeek LLM generation and local FAISS retrieval.
 
 ## Architecture
 
-The runtime flow is:
+The runtime flow is standard RAG:
 
-`User query -> route_query -> retrieve -> plan tool calls -> execute tools -> grounded synthesis -> validate -> answer`
+`User query -> route_query -> retrieve chunks -> search_documents tool -> grounded synthesis -> validate -> answer`
 
 - `documents.py` loads the three Markdown documents and chunks by headings and
   paragraphs. It intentionally does not depend on strict Markdown table parsing,
@@ -21,16 +21,13 @@ The runtime flow is:
 - `graph.py` builds the four-node LangGraph workflow when `langgraph` is
   installed. The same node functions run locally without LangGraph so the
   package remains testable in lightweight environments.
-- `answering.py` implements a Plan-Execute style agent controller. When
-  `ME_USE_LLM_PLANNER=true`, the configured chat model chooses function calls
-  instead of answering directly. The offline fallback planner uses the same tool
-  interface so local tests remain deterministic. The answer composer is generic:
-  it infers lookup, comparison, ranking, or filtering intent and formats only the
-  evidence returned by tools, rather than maintaining one function per expected
-  user question.
+- `answering.py` implements the RAG answer controller. It does not maintain a
+  growing list of specification fields or one function per expected user
+  question. Every query follows the same rule: retrieve relevant chunks, compose
+  an answer only from those chunks, and fall back to an insufficient-evidence
+  answer when the retrieved documentation does not support the request.
 - `tools.py` exposes the internal functions available to the agent:
-  `search_documents`, `read_model_spec`, `compare_model_specs`, and
-  `list_models`.
+  `search_documents` and `list_sources`.
 - `mcp_server.py` runs a real Model Context Protocol server using the official
   Python SDK. MCP clients can discover and call the same ECU tools over stdio or
   Streamable HTTP.
@@ -45,6 +42,7 @@ The anti-hallucination guardrails are intentionally simple and inspectable:
 - the final answer is generated from returned tool evidence;
 - answers include source filenames from the internal documentation;
 - numeric values and commands are checked against tool evidence;
+- subjective or unsupported criteria are not guessed from unrelated specs;
 - missing evidence or unsupported ECU models reduce confidence and can trigger
   the human review queue.
 
@@ -55,6 +53,15 @@ Run the assistant directly from the source tree:
 ```bash
 PYTHONPATH=src python3 -m me_engineering_assistant "Compare the CAN bus capabilities of ECU-750 and ECU-850."
 ```
+
+Start the minimal interactive CLI:
+
+```bash
+PYTHONPATH=src python3 -m me_engineering_assistant
+```
+
+The prompt asks `Question>`; type a question and the assistant prints separated
+`Answer`, `Sources`, and `Confidence` sections instead of raw JSON.
 
 Run the golden evaluation:
 
@@ -90,8 +97,8 @@ ME_USE_LLM_PLANNER=true ME_USE_LLM_ANSWER=true PYTHONPATH=src python3 -m me_engi
   "Summarize the differences between ECU-850 and ECU-850b."
 ```
 
-For deterministic offline tests, leave those flags as `false`; the same
-function-call tools are still used through the local fallback planner.
+For deterministic offline tests, leave those flags as `false`; the same RAG
+retrieval tool is still used through the local fallback planner.
 
 To inspect the agent process, enable trace output:
 
@@ -164,13 +171,11 @@ PYTHONPATH=src python -m me_engineering_assistant.mcp_server \
 The server exposes these MCP tools:
 
 - `search_documents`: retrieve source chunks from ECU manuals;
-- `read_model_spec`: return extracted specs for one ECU model;
-- `compare_model_specs`: compare fields across models;
-- `list_models`: list indexed ECU models.
+- `list_sources`: list indexed ECU source documents.
 
 It also exposes resources:
 
-- `ecu://models`
+- `ecu://sources`
 - `ecu://docs/{source}`
 
 For HTTP-based MCP clients, run Streamable HTTP:

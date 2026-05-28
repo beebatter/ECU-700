@@ -9,6 +9,7 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "src"))
 
+# pylint: disable=wrong-import-position
 from me_engineering_assistant.graph import ECUAgent
 from me_engineering_assistant.visualization import trace_to_markdown, trace_to_mermaid
 
@@ -31,7 +32,7 @@ class TraceTests(unittest.TestCase):
             step_names,
             ["route_query", "retrieve", "plan", "execute_tools", "synthesize", "grounding", "validate"],
         )
-        self.assertIn("compare_model_specs", str(plan_step["details"]["tool_calls"]))
+        self.assertIn("search_documents", str(plan_step["details"]["tool_calls"]))
 
     def test_trace_visualizations_render(self) -> None:
         payload = self.agent.answer("How much RAM does the ECU-850 have?", include_trace=True).to_dict()

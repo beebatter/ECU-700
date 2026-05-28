@@ -1,7 +1,9 @@
 from __future__ import annotations
 
 import inspect
+import os
 import sys
+import tempfile
 import unittest
 from pathlib import Path
 
@@ -11,11 +13,18 @@ sys.path.insert(0, str(ROOT / "src"))
 
 # pylint: disable=wrong-import-position
 from me_engineering_assistant import answering
-from me_engineering_assistant.answering import infer_query_intent
 from me_engineering_assistant.graph import ECUAgent
 
 
 class AnsweringTests(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls) -> None:
+        os.environ["ME_USE_LLM_PLANNER"] = "false"
+        os.environ["ME_USE_LLM_ANSWER"] = "false"
+        os.environ["ME_FORCE_LLM"] = "false"
+        os.environ["ME_AGENT_LOG_ENABLED"] = "false"
+        cls.agent = ECUAgent(docs_dir=ROOT)
+
     def test_answering_has_no_question_specific_synthesizers(self) -> None:
         synthesizers = [
             name
@@ -25,19 +34,47 @@ class AnsweringTests(unittest.TestCase):
 
         self.assertEqual(synthesizers, [])
 
-    def test_intent_does_not_treat_modal_can_as_can_bus(self) -> None:
-        intent = infer_query_intent("Which ECU can operate in the harshest temperature conditions?")
+    def test_answering_has_no_field_intent_helpers(self) -> None:
+        helper_names = {name for name, _function in inspect.getmembers(answering, inspect.isfunction)}
 
-        self.assertEqual(intent.operation, "rank")
-        self.assertEqual(intent.fields, ["operating_temperature"])
+        self.assertNotIn("infer_query_intent", helper_names)
+        self.assertNotIn("infer_fields_from_query", helper_names)
 
-    def test_generic_composer_answers_unseen_field_combination(self) -> None:
-        agent = ECUAgent(docs_dir=ROOT)
-
-        response = agent.answer("Tell me the processor and storage for ECU-850b.")
+    def test_standard_rag_answers_unseen_field_combination_from_evidence(self) -> None:
+        response = self.agent.answer("Tell me the processor and storage for ECU-850b.")
 
         self.assertIn("Dual-core ARM Cortex-A53 @ 1.5 GHz", response.answer)
         self.assertIn("32 GB eMMC", response.answer)
+
+    def test_open_ended_question_uses_retrieved_evidence(self) -> None:
+        query = "Which is better for edge AI deployment, ECU-850 or ECU-850b?"
+
+        response = self.agent.answer(query)
+
+        self.assertIn("ECU-850b", response.answer)
+        self.assertIn("5 TOPS", response.answer)
+
+    def test_subjective_unbacked_question_goes_to_review(self) -> None:
+        previous = {
+            "ME_REVIEW_QUEUE_PATH": os.environ.get("ME_REVIEW_QUEUE_PATH"),
+            "ME_HITL_ENABLED": os.environ.get("ME_HITL_ENABLED"),
+        }
+        with tempfile.TemporaryDirectory() as temp_dir:
+            try:
+                os.environ["ME_REVIEW_QUEUE_PATH"] = str(Path(temp_dir) / "review.jsonl")
+                os.environ["ME_HITL_ENABLED"] = "true"
+
+                response = self.agent.answer("ECU-850 和 ECU-850b 哪个更好看一点?")
+
+                self.assertIn("does not contain enough evidence", response.answer)
+                self.assertLess(response.confidence, 0.75)
+                self.assertTrue(response.needs_review)
+            finally:
+                for key, value in previous.items():
+                    if value is None:
+                        os.environ.pop(key, None)
+                    else:
+                        os.environ[key] = value
 
 
 if __name__ == "__main__":

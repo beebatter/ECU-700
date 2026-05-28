@@ -48,13 +48,13 @@ class MCPServerTests(unittest.TestCase):
                 await session.initialize()
                 tools = await session.list_tools()
                 tool_names = {tool.name for tool in tools.tools}
-                result = await session.call_tool("read_model_spec", {"model": "ECU-850"})
+                result = await session.call_tool("search_documents", {"query": "How much RAM does ECU-850 have?"})
 
-        self.assertIn("read_model_spec", tool_names)
-        self.assertIn("compare_model_specs", tool_names)
+        self.assertIn("search_documents", tool_names)
+        self.assertIn("list_sources", tool_names)
         self.assertFalse(result.isError)
-        self.assertEqual(result.structuredContent["result"]["memory_ram"], "2 GB LPDDR4")
-        self.assertEqual(result.structuredContent["sources"], ["ECU-800_Series_Base.md"])
+        self.assertIn("2 GB", str(result.structuredContent["result"]))
+        self.assertIn("ECU-800_Series_Base.md", result.structuredContent["sources"])
 
 
 if __name__ == "__main__":

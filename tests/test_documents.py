@@ -8,8 +8,8 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "src"))
 
+# pylint: disable=wrong-import-position
 from me_engineering_assistant.documents import chunk_documents, load_source_documents
-from me_engineering_assistant.knowledge import extract_specs
 
 
 class DocumentTests(unittest.TestCase):
@@ -27,14 +27,14 @@ class DocumentTests(unittest.TestCase):
         self.assertGreaterEqual(len(chunks), 8)
         self.assertTrue(any("CAN Interface" in chunk.content for chunk in chunks))
 
-    def test_extracts_specs_from_malformed_can_row(self) -> None:
-        specs = extract_specs(load_source_documents(base_path=ROOT))
+    def test_table_text_remains_available_for_rag_retrieval(self) -> None:
+        chunks = chunk_documents(load_source_documents(base_path=ROOT))
+        combined = "\n".join(chunk.content for chunk in chunks)
 
-        self.assertIn("1 Mbps", specs["ECU-750"].can_interface or "")
-        self.assertEqual(specs["ECU-850"].memory_ram, "2 GB LPDDR4")
-        self.assertEqual(specs["ECU-850b"].npu, "5 TOPS AI Accelerator")
+        self.assertIn("1 Mbps", combined)
+        self.assertIn("2 GB", combined)
+        self.assertIn("5 TOPS AI Accelerator", combined)
 
 
 if __name__ == "__main__":
     unittest.main()
-

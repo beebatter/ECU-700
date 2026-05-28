@@ -30,7 +30,7 @@ def create_mcp_server(
         SERVER_NAME,
         instructions=(
             "Ground ECU engineering answers in the internal ECU Markdown manuals. "
-            "Use tools for document search and model specification lookup before answering."
+            "Use semantic document search before answering."
         ),
         host=host,
         port=port,
@@ -38,33 +38,26 @@ def create_mcp_server(
     )
 
     @server.tool()
-    def search_documents(query: str, models: list[str] | None = None, top_k: int = 4) -> dict[str, Any]:
+    def search_documents(
+        query: str,
+        models: list[str] | None = None,
+        sources: list[str] | None = None,
+        top_k: int = 6,
+    ) -> dict[str, Any]:
         """Search internal ECU documentation chunks for grounding evidence."""
-        if top_k < 1 or top_k > 8:
-            raise ToolError("top_k must be between 1 and 8")
-        return toolbox.search_documents(query=query, models=models, top_k=top_k).to_dict()
+        if top_k < 1 or top_k > 10:
+            raise ToolError("top_k must be between 1 and 10")
+        return toolbox.search_documents(query=query, models=models, sources=sources, top_k=top_k).to_dict()
 
     @server.tool()
-    def read_model_spec(model: str) -> dict[str, Any]:
-        """Return extracted specifications for one ECU model."""
-        return toolbox.read_model_spec(model=model).to_dict()
+    def list_sources() -> dict[str, Any]:
+        """List source documents available in the indexed internal documentation."""
+        return toolbox.list_sources().to_dict()
 
-    @server.tool()
-    def compare_model_specs(models: list[str], fields: list[str] | None = None) -> dict[str, Any]:
-        """Compare selected specification fields across ECU models."""
-        if not models:
-            raise ToolError("models must include at least one ECU model name")
-        return toolbox.compare_model_specs(models=models, fields=fields).to_dict()
-
-    @server.tool()
-    def list_models() -> dict[str, Any]:
-        """List ECU models available in the indexed internal documentation."""
-        return toolbox.list_models().to_dict()
-
-    @server.resource("ecu://models")
-    def models_resource() -> str:
-        """Return available ECU models as JSON."""
-        return json.dumps(toolbox.list_models().to_dict(), indent=2)
+    @server.resource("ecu://sources")
+    def sources_resource() -> str:
+        """Return available ECU source documents as JSON."""
+        return json.dumps(toolbox.list_sources().to_dict(), indent=2)
 
     @server.resource("ecu://docs/{source}")
     def document_resource(source: str) -> str:
