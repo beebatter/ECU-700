@@ -24,7 +24,10 @@ The runtime flow is:
 - `answering.py` implements a Plan-Execute style agent controller. When
   `ME_USE_LLM_PLANNER=true`, the configured chat model chooses function calls
   instead of answering directly. The offline fallback planner uses the same tool
-  interface so local tests remain deterministic.
+  interface so local tests remain deterministic. The answer composer is generic:
+  it infers lookup, comparison, ranking, or filtering intent and formats only the
+  evidence returned by tools, rather than maintaining one function per expected
+  user question.
 - `tools.py` exposes the internal functions available to the agent:
   `search_documents`, `read_model_spec`, `compare_model_specs`, and
   `list_models`.

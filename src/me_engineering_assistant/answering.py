@@ -31,27 +31,50 @@ class AgentPlan:
     calls: list[ToolCall]
 
 
+@dataclass(frozen=True)
+class QueryIntent:
+    """General user intent, independent of any golden test question."""
+
+    operation: str
+    models: list[str]
+    fields: list[str]
+    rank_direction: str | None = None
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "operation": self.operation,
+            "models": self.models,
+            "fields": self.fields,
+            "rank_direction": self.rank_direction,
+        }
+
+
 def generate_answer(
     query: str,
     toolbox: ECUToolbox,
     retrieved: Sequence[RetrievalResult],
     route: Mapping[str, Any] | None = None,
 ) -> AnswerDraft:
-    plan = plan_tool_calls(query=query, toolbox=toolbox, route=route)
+    intent = infer_query_intent(query, route)
+    plan = plan_tool_calls(query=query, toolbox=toolbox, route=route, intent=intent)
     trace = [
         trace_step(
             "plan",
             summary=plan.rationale,
+            intent=intent.to_dict(),
             tool_calls=[tool_call_to_dict(call) for call in plan.calls],
         )
     ]
     tool_results = execute_plan(toolbox, plan)
     if not any(result.name == "search_documents" for result in tool_results):
-        fallback_search = ToolCall(
-            "search_documents",
-            {"query": query, "models": list((route or {}).get("models") or ()), "top_k": 4},
+        tool_results.append(
+            toolbox.execute(
+                ToolCall(
+                    "search_documents",
+                    {"query": query, "models": intent.models, "top_k": 4},
+                )
+            )
         )
-        tool_results.append(toolbox.execute(fallback_search))
 
     trace.append(
         trace_step(
@@ -63,17 +86,18 @@ def generate_answer(
 
     evidence_sources = _sources_from_results(tool_results) or _sources_from_retrieval(retrieved)
     answer = None
-    synthesis_mode = "deterministic"
+    synthesis_mode = "generic_evidence_composer"
     if bool_env("ME_USE_LLM_ANSWER", default=False) or bool_env("ME_FORCE_LLM", default=False):
-        answer = synthesize_with_llm(query=query, plan=plan, tool_results=tool_results)
-        synthesis_mode = "llm_grounded" if answer else "deterministic_after_llm_fallback"
+        answer = compose_with_llm(query=query, plan=plan, tool_results=tool_results, intent=intent)
+        synthesis_mode = "llm_grounded" if answer else "generic_after_llm_fallback"
     if not answer:
-        answer = synthesize_from_tool_results(query=query, tool_results=tool_results)
+        answer = compose_from_evidence(query=query, tool_results=tool_results, intent=intent)
     trace.append(
         trace_step(
             "synthesize",
-            summary=f"Generated draft answer with {synthesis_mode} synthesis.",
+            summary=f"Generated draft answer with {synthesis_mode}.",
             mode=synthesis_mode,
+            intent=intent.to_dict(),
         )
     )
 
@@ -105,12 +129,14 @@ def plan_tool_calls(
     query: str,
     toolbox: ECUToolbox,
     route: Mapping[str, Any] | None = None,
+    intent: QueryIntent | None = None,
 ) -> AgentPlan:
+    intent = intent or infer_query_intent(query, route)
     if bool_env("ME_USE_LLM_PLANNER", default=False):
-        llm_plan = plan_with_llm(query=query, toolbox=toolbox, route=route)
+        llm_plan = plan_with_llm(query=query, toolbox=toolbox, route=route, intent=intent)
         if llm_plan and llm_plan.calls:
-            return complete_plan(query=query, route=route, plan=llm_plan)
-    return fallback_plan(query=query, route=route)
+            return complete_plan(query=query, route=route, plan=llm_plan, intent=intent)
+    return fallback_plan(query=query, route=route, intent=intent)
 
 
 def plan_with_llm(
@@ -118,22 +144,28 @@ def plan_with_llm(
     query: str,
     toolbox: ECUToolbox,
     route: Mapping[str, Any] | None = None,
+    intent: QueryIntent | None = None,
 ) -> AgentPlan | None:
     messages = [
         {
             "role": "system",
             "content": (
                 "You are a ReAct/Plan-Execute controller for an ECU engineering RAG agent. "
-                "Choose tool calls that can answer the question from internal ECU documentation. "
-                "Do not answer directly. Return strict JSON only with keys rationale and tool_calls. "
-                "Each tool call must have name and arguments. Available tools:\n"
+                "Infer the user's intent and choose tool calls that can answer the question "
+                "from internal ECU documentation. Do not answer directly. Return strict JSON "
+                "only with keys rationale and tool_calls. Each tool call must have name and "
+                "arguments. Available tools:\n"
                 f"{json.dumps(toolbox.manifest(), indent=2)}"
             ),
         },
         {
             "role": "user",
             "content": json.dumps(
-                {"query": query, "router_hint": route or {}},
+                {
+                    "query": query,
+                    "router_hint": route or {},
+                    "local_intent_hint": (intent or infer_query_intent(query, route)).to_dict(),
+                },
                 ensure_ascii=False,
             ),
         },
@@ -149,36 +181,41 @@ def plan_with_llm(
     return AgentPlan(rationale=str(payload.get("rationale") or "LLM planned tool calls."), calls=calls)
 
 
-def fallback_plan(query: str, route: Mapping[str, Any] | None = None) -> AgentPlan:
-    models = list((route or {}).get("models") or models_in_query(query))
-    if not models and _mentions_all_models(query):
-        models = list(MODEL_ORDER)
-    fields = infer_fields_from_query(query)
-    calls = [ToolCall("search_documents", {"query": query, "models": models, "top_k": 4})]
-    if len(models) == 1 and not _is_comparison_query(query):
-        calls.append(ToolCall("read_model_spec", {"model": models[0]}))
-    elif models:
-        calls.append(ToolCall("compare_model_specs", {"models": models, "fields": fields}))
+def fallback_plan(
+    query: str,
+    route: Mapping[str, Any] | None = None,
+    intent: QueryIntent | None = None,
+) -> AgentPlan:
+    intent = intent or infer_query_intent(query, route)
+    calls = [ToolCall("search_documents", {"query": query, "models": intent.models, "top_k": 4})]
+    if intent.operation in {"compare", "rank", "filter"} and intent.models:
+        calls.append(ToolCall("compare_model_specs", {"models": intent.models, "fields": intent.fields}))
+    elif len(intent.models) == 1:
+        calls.append(ToolCall("read_model_spec", {"model": intent.models[0]}))
+    elif intent.models:
+        calls.append(ToolCall("compare_model_specs", {"models": intent.models, "fields": intent.fields}))
     else:
         calls.append(ToolCall("list_models", {}))
-    return AgentPlan(rationale="Local fallback planner selected evidence tools.", calls=calls)
+    return AgentPlan(rationale="Local intent planner selected evidence tools.", calls=calls)
 
 
-def complete_plan(query: str, route: Mapping[str, Any] | None, plan: AgentPlan) -> AgentPlan:
-    models = list((route or {}).get("models") or models_in_query(query))
-    if not models and _mentions_all_models(query):
-        models = list(MODEL_ORDER)
-
+def complete_plan(
+    query: str,
+    route: Mapping[str, Any] | None,
+    plan: AgentPlan,
+    intent: QueryIntent | None = None,
+) -> AgentPlan:
+    intent = intent or infer_query_intent(query, route)
     calls = list(plan.calls)
     tool_names = [call.name for call in calls]
-    fields = infer_fields_from_query(query)
     if "search_documents" not in tool_names:
-        calls.insert(0, ToolCall("search_documents", {"query": query, "models": models, "top_k": 4}))
-    if len(models) > 1 and "compare_model_specs" not in tool_names:
-        calls.append(ToolCall("compare_model_specs", {"models": models, "fields": fields}))
-    elif len(models) == 1 and not _is_comparison_query(query) and "read_model_spec" not in tool_names:
-        calls.append(ToolCall("read_model_spec", {"model": models[0]}))
-    return AgentPlan(rationale=f"{plan.rationale} Plan validated against router intent.", calls=calls)
+        calls.insert(0, ToolCall("search_documents", {"query": query, "models": intent.models, "top_k": 4}))
+    needs_structured_specs = intent.operation in {"compare", "rank", "filter"} or len(intent.models) > 1
+    if needs_structured_specs and intent.models and "compare_model_specs" not in tool_names:
+        calls.append(ToolCall("compare_model_specs", {"models": intent.models, "fields": intent.fields}))
+    elif len(intent.models) == 1 and "read_model_spec" not in tool_names:
+        calls.append(ToolCall("read_model_spec", {"model": intent.models[0]}))
+    return AgentPlan(rationale=f"{plan.rationale} Plan validated against inferred intent.", calls=calls)
 
 
 def execute_plan(toolbox: ECUToolbox, plan: AgentPlan) -> list[ToolResult]:
@@ -213,7 +250,12 @@ def tool_result_summary(result: ToolResult) -> dict[str, Any]:
     }
 
 
-def synthesize_with_llm(query: str, plan: AgentPlan, tool_results: Sequence[ToolResult]) -> str | None:
+def compose_with_llm(
+    query: str,
+    plan: AgentPlan,
+    tool_results: Sequence[ToolResult],
+    intent: QueryIntent,
+) -> str | None:
     messages = [
         {
             "role": "system",
@@ -229,6 +271,7 @@ def synthesize_with_llm(query: str, plan: AgentPlan, tool_results: Sequence[Tool
             "content": json.dumps(
                 {
                     "question": query,
+                    "inferred_intent": intent.to_dict(),
                     "plan_rationale": plan.rationale,
                     "tool_results": [result.to_dict() for result in tool_results],
                 },
@@ -239,10 +282,11 @@ def synthesize_with_llm(query: str, plan: AgentPlan, tool_results: Sequence[Tool
     return chat_with_configured_llm(messages, temperature=0.0)
 
 
-def synthesize_from_tool_results(
+def compose_from_evidence(
     *,
     query: str,
     tool_results: Sequence[ToolResult],
+    intent: QueryIntent | None = None,
 ) -> str:
     unknown_models = unknown_models_in_query(query)
     if unknown_models:
@@ -253,12 +297,18 @@ def synthesize_from_tool_results(
             "current ECU documents."
         )
 
-    comparison = _first_result(tool_results, "compare_model_specs")
-    single_spec = _first_result(tool_results, "read_model_spec")
-    if comparison and isinstance(comparison.result, list):
-        return synthesize_comparison(query=query, rows=comparison.result, fields=comparison.arguments.get("fields", []))
-    if single_spec and isinstance(single_spec.result, dict):
-        return synthesize_single_spec(query=query, spec=single_spec.result)
+    intent = intent or infer_query_intent(query)
+    rows = _evidence_rows(tool_results)
+    if rows:
+        fields = _select_fields(intent.fields, rows)
+        if intent.operation == "rank":
+            return _compose_rank_response(rows, fields, intent.rank_direction)
+        if intent.operation == "filter":
+            return _compose_filter_response(rows, fields)
+        if intent.operation == "compare" or len(rows) > 1:
+            return _compose_comparison_response(rows, fields)
+        return _compose_lookup_response(rows[0], fields)
+
     search = _first_result(tool_results, "search_documents")
     if search and isinstance(search.result, list) and search.result:
         excerpts = " ".join(_one_line(str(item.get("content", ""))) for item in search.result[:2])
@@ -266,82 +316,79 @@ def synthesize_from_tool_results(
     return "I could not find enough evidence in the internal ECU documentation to answer this question."
 
 
-def synthesize_single_spec(query: str, spec: Mapping[str, Any]) -> str:
-    fields = infer_fields_from_query(query)
-    source = spec.get("source")
-    model = spec.get("model", "The requested ECU")
-    if "npu_enable_command" in fields and spec.get("npu_enable_command"):
-        return f"To enable the NPU on the {model}, run `{spec['npu_enable_command']}`. Source: {source}."
-    if "npu" in fields and spec.get("npu"):
-        return (
-            f"The {model} includes a dedicated Neural Processing Unit (NPU), {spec['npu']}, "
-            f"for AI acceleration. Source: {source}."
-        )
-    if "ota_supported" in fields:
-        support = "supports" if spec.get("ota_supported") else "does not support"
-        return f"The {model} {support} OTA updates. Source: {source}."
-    values = [(field, spec.get(field)) for field in fields if spec.get(field) is not None]
-    if values:
-        field, value = values[0]
-        return f"The {model} {human_field_phrase(field)} is {value}. Source: {source}."
-    return f"{model} specification evidence was found, but not for the requested field. Source: {source}."
+def _compose_lookup_response(row: Mapping[str, Any], fields: Sequence[str]) -> str:
+    model = str(row.get("model") or "The requested ECU")
+    facts = _field_facts(row, fields)
+    source = row.get("source")
+    if not facts:
+        return f"{model} evidence was found, but not for the requested field. Source: {source}."
+    if len(facts) == 1:
+        return f"{model} {facts[0]}. Source: {source}."
+    return f"{model}: " + "; ".join(facts) + f". Source: {source}."
 
 
-def synthesize_comparison(query: str, rows: Sequence[Mapping[str, Any]], fields: Sequence[str]) -> str:
-    selected_fields = normalize_fields(fields or infer_fields_from_query(query))
-    if _asks_harshest(query) and "operating_temperature" in selected_fields:
-        return synthesize_harshest_temperature(rows)
-    if selected_fields == ["ota_supported"]:
-        supported = [row["model"] for row in rows if row.get("ota_supported") is True]
-        unsupported = [row["model"] for row in rows if row.get("ota_supported") is False]
-        parts = []
-        if supported:
-            parts.append(f"OTA updates are supported by {', '.join(supported)}")
-        if unsupported:
-            parts.append(f"{', '.join(unsupported)} does not support OTA updates")
-        return "; ".join(parts) + f". Sources: {format_sources_from_rows(rows)}."
-
-    if _is_difference_query(query) and len(rows) == 2:
-        diffs = []
-        for field in selected_fields:
-            first = rows[0].get(field)
-            second = rows[1].get(field)
-            if first != second and (first is not None or second is not None):
-                diffs.append(f"{human_field_phrase(field)} ({rows[0]['model']}: {first}; {rows[1]['model']}: {second})")
-        if diffs:
-            return "Key differences are: " + "; ".join(diffs) + f". Sources: {format_sources_from_rows(rows)}."
-
-    row_phrases = []
+def _compose_comparison_response(rows: Sequence[Mapping[str, Any]], fields: Sequence[str]) -> str:
+    parts = []
     for row in rows:
-        values = [
-            f"{human_field_phrase(field)}: {row.get(field)}"
-            for field in selected_fields
-            if row.get(field) is not None
-        ]
-        if values:
-            row_phrases.append(f"{row['model']}: " + ", ".join(values))
-    if row_phrases:
-        return "; ".join(row_phrases) + f". Sources: {format_sources_from_rows(rows)}."
-    return "The internal documentation did not contain enough comparable evidence for the requested fields."
+        facts = _field_facts(row, fields)
+        if facts:
+            parts.append(f"{row.get('model')}: " + ", ".join(facts))
+    if not parts:
+        return "The internal documentation did not contain enough comparable evidence for the requested fields."
+    return "Comparison: " + "; ".join(parts) + f". Sources: {_format_sources(rows)}."
 
 
-def synthesize_harshest_temperature(rows: Sequence[Mapping[str, Any]]) -> str:
+def _compose_filter_response(rows: Sequence[Mapping[str, Any]], fields: Sequence[str]) -> str:
+    bool_field = next(
+        (
+            field
+            for field in fields
+            if any(isinstance(row.get(field), bool) for row in rows)
+        ),
+        None,
+    )
+    if not bool_field:
+        return _compose_comparison_response(rows, fields)
+
+    subject = _boolean_subject(bool_field)
+    supported = [str(row.get("model")) for row in rows if row.get(bool_field) is True]
+    unsupported = [str(row.get("model")) for row in rows if row.get(bool_field) is False]
+    parts = []
+    if supported:
+        parts.append(f"{subject} are supported by {', '.join(supported)}")
+    if unsupported:
+        parts.append(f"{', '.join(unsupported)} does not support {subject}")
+    if not parts:
+        return f"The internal documentation did not contain enough {subject} evidence."
+    return "; ".join(parts) + f". Sources: {_format_sources(rows)}."
+
+
+def _compose_rank_response(
+    rows: Sequence[Mapping[str, Any]],
+    fields: Sequence[str],
+    direction: str | None,
+) -> str:
+    field = fields[0] if fields else "operating_temperature"
     scored = []
     for row in rows:
-        high = _temperature_high(str(row.get("operating_temperature") or ""))
-        if high is not None:
-            scored.append((high, row))
+        value = row.get(field)
+        score = _score_value(value, direction or "max")
+        if score is not None:
+            scored.append((score, row, value))
     if not scored:
-        return "The internal documentation does not contain enough temperature evidence to compare models."
-    best_high = max(score for score, _ in scored)
-    best = [row for score, row in scored if score == best_high]
-    best_models = " and ".join(row["model"] for row in best)
-    baseline = "; ".join(
-        f"{row['model']}: {row.get('operating_temperature')}" for _, row in scored
+        return f"The internal documentation does not contain enough {human_field_phrase(field)} evidence."
+
+    winner_score = min(score for score, _, _ in scored) if direction == "min" else max(score for score, _, _ in scored)
+    winners = [row for score, row, _ in scored if score == winner_score]
+    winner_models = ", ".join(str(row.get("model")) for row in winners)
+    values = "; ".join(
+        f"{row.get('model')}: {value}"
+        for _, row, value in scored
     )
+    label = "Lowest" if direction == "min" else "Highest"
     return (
-        f"{best_models} can operate in the harshest high-temperature conditions. "
-        f"Temperature ranges: {baseline}. Sources: {format_sources_from_rows(rows)}."
+        f"{label} {human_field_phrase(field)}: {winner_models}. "
+        f"Retrieved values: {values}. Sources: {_format_sources(rows)}."
     )
 
 
@@ -372,6 +419,34 @@ def apply_grounding_checks(
     return answer, confidence
 
 
+def infer_query_intent(
+    query: str,
+    route: Mapping[str, Any] | None = None,
+) -> QueryIntent:
+    models = list((route or {}).get("models") or models_in_query(query))
+    if not models and _mentions_all_models(query):
+        models = list(MODEL_ORDER)
+
+    fields = infer_fields_from_query(query)
+    operation = "lookup"
+    rank_direction = _rank_direction(query)
+    if rank_direction and len(models) != 1:
+        operation = "rank"
+    elif _is_filter_query(query):
+        operation = "filter"
+    elif _is_comparison_query(query) or len(models) > 1:
+        operation = "compare"
+    elif not models and _is_inventory_query(query):
+        operation = "enumerate"
+
+    return QueryIntent(
+        operation=operation,
+        models=models,
+        fields=fields,
+        rank_direction=rank_direction,
+    )
+
+
 def infer_fields_from_query(query: str) -> list[str]:
     lowered = query.lower()
     fields = []
@@ -382,7 +457,7 @@ def infer_fields_from_query(query: str) -> list[str]:
         (("ram",), "memory_ram"),
         (("memory",), "memory_ram"),
         (("storage",), "storage"),
-        (("can",), "can_interface"),
+        (("can_bus",), "can_interface"),
         (("power",), "power_consumption"),
         (("load",), "power_consumption"),
         (("temperature",), "operating_temperature"),
@@ -394,7 +469,7 @@ def infer_fields_from_query(query: str) -> list[str]:
         (("clock",), "processor"),
     )
     for keywords, field in keyword_map:
-        if all(keyword in lowered for keyword in keywords) and field not in fields:
+        if all(_keyword_present(lowered, keyword) for keyword in keywords) and field not in fields:
             fields.append(field)
     if _is_difference_query(query) and not fields:
         fields = ["processor", "npu", "memory_ram", "storage", "power_consumption"]
@@ -442,7 +517,62 @@ def human_field_phrase(field: str) -> str:
     }.get(field, field.replace("_", " "))
 
 
-def format_sources_from_rows(rows: Sequence[Mapping[str, Any]]) -> str:
+def _evidence_rows(tool_results: Sequence[ToolResult]) -> list[dict[str, Any]]:
+    compare = _first_result(tool_results, "compare_model_specs")
+    if compare and isinstance(compare.result, list):
+        return _dedupe_rows(compare.result)
+
+    rows: list[Mapping[str, Any]] = []
+    for result in tool_results:
+        payload = result.result
+        if result.name == "read_model_spec" and isinstance(payload, dict) and payload.get("model"):
+            rows.append(payload)
+        elif result.name == "list_models" and isinstance(payload, list):
+            rows.extend(item for item in payload if isinstance(item, dict))
+    return _dedupe_rows(rows)
+
+
+def _dedupe_rows(rows: Sequence[Mapping[str, Any]]) -> list[dict[str, Any]]:
+    seen: set[str] = set()
+    deduped: list[dict[str, Any]] = []
+    for row in rows:
+        model = str(row.get("model") or "")
+        if not model or model in seen or row.get("error"):
+            continue
+        seen.add(model)
+        deduped.append(dict(row))
+    return deduped
+
+
+def _select_fields(fields: Sequence[str], rows: Sequence[Mapping[str, Any]]) -> list[str]:
+    selected = normalize_fields(fields)
+    available = [field for field in selected if any(row.get(field) is not None for row in rows)]
+    return available or selected
+
+
+def _field_facts(row: Mapping[str, Any], fields: Sequence[str]) -> list[str]:
+    facts = []
+    for field in fields:
+        value = row.get(field)
+        if value is None:
+            continue
+        facts.append(f"{human_field_phrase(field)}: {_format_value(field, value)}")
+    return facts
+
+
+def _format_value(field: str, value: Any) -> str:
+    if isinstance(value, bool):
+        return "supported" if value else "does not support"
+    if field == "npu_enable_command":
+        return f"`{value}`"
+    return str(value)
+
+
+def _boolean_subject(field: str) -> str:
+    return {"ota_supported": "OTA updates"}.get(field, human_field_phrase(field))
+
+
+def _format_sources(rows: Sequence[Mapping[str, Any]]) -> str:
     return ", ".join(sorted({str(row.get("source")) for row in rows if row.get("source")}))
 
 
@@ -476,7 +606,7 @@ def _models_from_tool_results(tool_results: Sequence[ToolResult]) -> list[str]:
 
 def _mentions_all_models(query: str) -> bool:
     lowered = query.lower()
-    return any(term in lowered for term in ("all ecu", "all models", "across all", "which ecu"))
+    return any(term in lowered for term in ("all ecu", "all models", "across all", "which ecu", "which model"))
 
 
 def _is_comparison_query(query: str) -> bool:
@@ -487,13 +617,68 @@ def _is_difference_query(query: str) -> bool:
     return bool(re.search(r"\b(differences?|different|upgrade|compare|versus|vs)\b", query.lower()))
 
 
-def _asks_harshest(query: str) -> bool:
-    return "harshest" in query.lower() or "which ecu can operate" in query.lower()
+def _is_filter_query(query: str) -> bool:
+    lowered = query.lower()
+    return bool(re.search(r"\b(support|supports|supported|available|capable)\b", lowered))
 
 
-def _temperature_high(value: str) -> int | None:
-    match = re.search(r"to\s*\+?(-?\d+)", value)
-    return int(match.group(1)) if match else None
+def _is_inventory_query(query: str) -> bool:
+    lowered = query.lower()
+    return any(term in lowered for term in ("what models", "list models", "available models", "what ecu"))
+
+
+def _keyword_present(lowered_query: str, keyword: str) -> bool:
+    if keyword == "can_bus":
+        return bool(re.search(r"\bcan\s+(bus|fd|interface|capab)", lowered_query))
+    if keyword in {"capab", "over-the-air"}:
+        return keyword in lowered_query
+    return bool(re.search(rf"\b{re.escape(keyword)}\b", lowered_query))
+
+
+def _rank_direction(query: str) -> str | None:
+    lowered = query.lower()
+    min_terms = ("lowest", "minimum", "smallest", "least", "coldest")
+    max_terms = ("highest", "maximum", "largest", "most", "harshest", "best")
+    if any(term in lowered for term in min_terms):
+        return "min"
+    if any(term in lowered for term in max_terms):
+        return "max"
+    if re.search(r"\bwhich\s+(ecu|model).*\b(can|has|operates?)\b", lowered):
+        return "max"
+    return None
+
+
+def _score_value(value: Any, direction: str) -> float | None:
+    if value is None:
+        return None
+    if isinstance(value, bool):
+        return 1.0 if value else 0.0
+    scores = [_normalize_number(number, unit) for number, unit in _number_unit_pairs(str(value))]
+    if not scores:
+        return None
+    return min(scores) if direction == "min" else max(scores)
+
+
+def _number_unit_pairs(value: str) -> list[tuple[float, str]]:
+    pairs = []
+    for number, unit in re.findall(
+        r"([+-]?\d+(?:\.\d+)?)\s*(gb|mb|mbps|tops|ghz|mhz|ma|a|v|°c|c)?",
+        value.lower(),
+    ):
+        pairs.append((float(number), unit))
+    return pairs
+
+
+def _normalize_number(number: float, unit: str) -> float:
+    multipliers = {
+        "gb": 1024.0,
+        "mb": 1.0,
+        "ghz": 1000.0,
+        "mhz": 1.0,
+        "a": 1000.0,
+        "ma": 1.0,
+    }
+    return number * multipliers.get(unit, 1.0)
 
 
 def _contains_numeric_or_command(answer: str) -> bool:
