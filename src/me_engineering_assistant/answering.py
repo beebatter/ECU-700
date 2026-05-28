@@ -452,11 +452,15 @@ def apply_grounding_checks(
     coverage_report: CoverageReport | None = None,
 ) -> tuple[str, float]:
     has_missing_evidence = "not contain enough" in answer.lower() or "could not find" in answer.lower()
-    confidence = 0.45 if has_missing_evidence else 0.62
-    if sources and evidence and not has_missing_evidence:
-        confidence = 0.9
-    if _contains_numeric_or_command(answer) and sources and not has_missing_evidence:
-        confidence = 0.95
+    top_score = max((item.score for item in evidence), default=0.0)
+    confidence = _estimate_confidence(
+        has_missing_evidence=has_missing_evidence,
+        sources=sources,
+        evidence=evidence,
+        coverage_report=coverage_report,
+        has_numeric_or_command=_contains_numeric_or_command(answer),
+        top_score=top_score,
+    )
 
     unsupported_claims = unsupported_numeric_or_command_claims(answer, tool_results, evidence)
     if unsupported_claims:
@@ -468,11 +472,44 @@ def apply_grounding_checks(
 
     if requested_models_without_evidence(query, evidence):
         confidence = min(confidence, 0.45)
-    if coverage_report and coverage_report.items:
-        confidence = min(confidence, 0.45) if not coverage_report.complete else max(confidence, 0.95)
     if sources and "source:" not in answer.lower() and "source" not in answer.lower():
         answer = f"{answer}\nsource: {', '.join(sources)}"
     return answer, confidence
+
+
+def _estimate_confidence(
+    *,
+    has_missing_evidence: bool,
+    sources: list[str],
+    evidence: Sequence[RetrievalResult],
+    coverage_report: CoverageReport | None,
+    has_numeric_or_command: bool,
+    top_score: float,
+) -> float:
+    if has_missing_evidence:
+        return 0.35
+
+    if not sources or not evidence:
+        return 0.3
+
+    quality = min(max(top_score, 0.0), 1.0)
+    source_count = len(set(sources))
+    evidence_count = len(evidence)
+
+    confidence = 0.35
+    confidence += min(0.2, 0.05 * evidence_count)
+    confidence += min(0.15, 0.05 * source_count)
+    confidence += 0.2 * quality
+    if has_numeric_or_command:
+        confidence += 0.05
+
+    if coverage_report and coverage_report.items:
+        if coverage_report.complete:
+            confidence = max(confidence, 0.85)
+        else:
+            confidence = min(confidence, 0.68)
+
+    return max(0.0, min(1.0, confidence))
 
 
 def evidence_from_tool_results(tool_results: Sequence[ToolResult]) -> list[RetrievalResult]:
