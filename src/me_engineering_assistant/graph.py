@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import re
+import time
 from dataclasses import asdict, dataclass
 from pathlib import Path
 from typing import Any, Mapping, Sequence, TypedDict
@@ -8,6 +9,7 @@ from typing import Any, Mapping, Sequence, TypedDict
 from me_engineering_assistant.answering import AnswerDraft, generate_answer, models_in_query
 from me_engineering_assistant.documents import chunk_documents, load_source_documents
 from me_engineering_assistant.knowledge import ECUSpec, extract_specs
+from me_engineering_assistant.observability import log_agent_response
 from me_engineering_assistant.review import maybe_enqueue_review
 from me_engineering_assistant.retriever import InMemoryECURetriever, RetrievalResult
 from me_engineering_assistant.tools import ECUToolbox
@@ -120,13 +122,15 @@ class ECUAgent:
         self._workflow = self._build_langgraph_workflow()
 
     def answer(self, query: str, include_trace: bool = False) -> AgentResponse:
+        started = time.perf_counter()
         if self._workflow is not None:
             state = self._workflow.invoke({"query": query})
         else:
             state = self._run_without_langgraph({"query": query})
 
         route = RouteDecision(**state["route"])
-        return AgentResponse(
+        trace = list(state.get("trace", []))
+        response = AgentResponse(
             answer=state["answer"],
             sources=list(state["sources"]),
             confidence=float(state["confidence"]),
@@ -134,8 +138,17 @@ class ECUAgent:
             needs_review=bool(state.get("needs_review", False)),
             review_id=state.get("review_id"),
             review_reason=state.get("review_reason"),
-            trace=list(state.get("trace", [])) if include_trace else None,
+            trace=trace if include_trace else None,
         )
+        log_agent_response(
+            query=query,
+            response=response.to_dict(),
+            trace=trace,
+            latency_seconds=time.perf_counter() - started,
+            retriever_backend=self.retriever.backend_name,
+            docs_dir=str(self.docs_dir) if self.docs_dir else None,
+        )
+        return response
 
     def invoke(self, query: str) -> dict[str, Any]:
         return self.answer(query).to_dict()

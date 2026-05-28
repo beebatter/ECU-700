@@ -8,6 +8,7 @@ __pycache__/
 .env
 mlruns/
 mlflow.db
+logs/
 review_queue*.jsonl
 evaluation_report*.json
 agent_trace*.md

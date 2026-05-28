@@ -40,6 +40,7 @@ me_evaluate = "me_engineering_assistant.evaluate:main"
 me_validate = "me_engineering_assistant.validate:main"
 me_log_model = "me_engineering_assistant.log_model:main"
 me_mcp_server = "me_engineering_assistant.mcp_server:main"
+me_logs = "me_engineering_assistant.observability:main"
 
 [tool.setuptools.packages.find]
 where = ["src"]

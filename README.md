@@ -109,6 +109,40 @@ PYTHONPATH=src python -m me_engineering_assistant \
   "How do you enable the NPU on the ECU-850b?"
 ```
 
+## Structured Logs
+
+Every agent answer can be written as a structured JSONL event for human or AI
+monitoring. The default path is `logs/agent_events.jsonl` and can be configured
+in `.env`:
+
+```bash
+ME_AGENT_LOG_ENABLED=true
+ME_AGENT_LOG_PATH=logs/agent_events.jsonl
+ME_AGENT_LOG_INCLUDE_TRACE=true
+ME_AGENT_LOG_LOW_CONFIDENCE_THRESHOLD=0.75
+ME_AGENT_LOG_SLOW_SECONDS=10
+```
+
+Each record includes the query, answer, sources, confidence, route decision,
+retriever backend, latency, review status, optional trace, and detector flags:
+
+- `low_confidence`
+- `missing_sources`
+- `needs_review`
+- `slow_response`
+
+Inspect the log summary:
+
+```bash
+python -m me_engineering_assistant.observability --json
+```
+
+or use the installed command:
+
+```bash
+me_logs --json
+```
+
 ## MCP Server
 
 Install the MCP extra:
