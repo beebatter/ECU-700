@@ -54,7 +54,38 @@ class AnsweringTests(unittest.TestCase):
         self.assertIn("ECU-850b", response.answer)
         self.assertIn("5 TOPS", response.answer)
 
-    def test_subjective_unbacked_question_goes_to_review(self) -> None:
+    def test_llm_tool_plan_is_sanitized_before_execution(self) -> None:
+        plan = answering.AgentPlan(
+            rationale="LLM supplied extra arguments.",
+            calls=[
+                answering.ToolCall(
+                    "search_documents",
+                    {
+                        "query": "storage capacity",
+                        "models": "ECU-850",
+                        "series": ["ECU-800"],
+                        "unexpected": "ignored",
+                        "top_k": 99,
+                    },
+                )
+            ],
+        )
+
+        sanitized = answering.sanitize_plan(
+            query="How does storage compare?",
+            route={"models": ["ECU-750", "ECU-850", "ECU-850b"]},
+            toolbox=self.agent.toolbox,
+            plan=plan,
+        )
+
+        self.assertEqual(len(sanitized.calls), 1)
+        arguments = sanitized.calls[0].arguments
+        self.assertNotIn("unexpected", arguments)
+        self.assertEqual(arguments["models"], ["ECU-850"])
+        self.assertEqual(arguments["series"], ["ECU-800"])
+        self.assertEqual(arguments["top_k"], 10)
+
+    def test_no_hardcoded_subjective_intent_gate(self) -> None:
         previous = {
             "ME_REVIEW_QUEUE_PATH": os.environ.get("ME_REVIEW_QUEUE_PATH"),
             "ME_HITL_ENABLED": os.environ.get("ME_HITL_ENABLED"),
@@ -66,9 +97,8 @@ class AnsweringTests(unittest.TestCase):
 
                 response = self.agent.answer("ECU-850 和 ECU-850b 哪个更好看一点?")
 
-                self.assertIn("does not contain enough evidence", response.answer)
-                self.assertLess(response.confidence, 0.75)
-                self.assertTrue(response.needs_review)
+                self.assertIn("Source:", response.answer)
+                self.assertFalse(response.needs_review)
             finally:
                 for key, value in previous.items():
                     if value is None:

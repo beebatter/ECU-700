@@ -52,6 +52,7 @@ class MCPServerTests(unittest.TestCase):
 
         self.assertIn("search_documents", tool_names)
         self.assertIn("list_sources", tool_names)
+        self.assertIn("check_evidence_coverage", tool_names)
         self.assertFalse(result.isError)
         self.assertIn("2 GB", str(result.structuredContent["result"]))
         self.assertIn("ECU-800_Series_Base.md", result.structuredContent["sources"])

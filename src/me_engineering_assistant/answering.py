@@ -5,19 +5,13 @@ import re
 from dataclasses import dataclass
 from typing import Any, Mapping, Sequence
 
-from me_engineering_assistant.config import bool_env
+from me_engineering_assistant.config import bool_env, env
+from me_engineering_assistant.coverage import CoverageReport, check_plan_coverage
 from me_engineering_assistant.llm import chat_with_configured_llm, json_with_configured_llm
+from me_engineering_assistant.planner import QueryPlan, models_in_query
 from me_engineering_assistant.retriever import RetrievalResult
 from me_engineering_assistant.tools import ECUToolbox, ToolCall, ToolResult, retrieval_results_from_tool
 from me_engineering_assistant.visualization import trace_step
-
-
-MODEL_ALIASES = {
-    "ECU-700": "ECU-750",
-    "ECU-800": "ECU-850",
-    "ECU-800A": "ECU-850",
-    "ECU-800B": "ECU-850b",
-}
 
 
 @dataclass(frozen=True)
@@ -41,18 +35,20 @@ def generate_answer(
     toolbox: ECUToolbox,
     retrieved: Sequence[RetrievalResult],
     route: Mapping[str, Any] | None = None,
+    query_plan: QueryPlan | None = None,
 ) -> AnswerDraft:
-    plan = plan_tool_calls(query=query, toolbox=toolbox, route=route)
+    plan = plan_tool_calls(query=query, toolbox=toolbox, route=route, query_plan=query_plan)
     trace = [
         trace_step(
             "plan",
             summary=plan.rationale,
+            query_plan=query_plan.to_dict() if query_plan else None,
             tool_calls=[tool_call_to_dict(call) for call in plan.calls],
         )
     ]
     tool_results = execute_plan(toolbox, plan)
     if not any(result.name == "search_documents" for result in tool_results):
-        tool_results.append(toolbox.execute(_search_call(query, route)))
+        tool_results.append(toolbox.execute(_search_call(query, route, query_plan=query_plan)))
 
     trace.append(
         trace_step(
@@ -63,14 +59,36 @@ def generate_answer(
     )
 
     evidence = evidence_from_tool_results(tool_results) or list(retrieved)
+    coverage_report = check_plan_coverage(query_plan, evidence) if query_plan else None
+    corrective_results = []
+    if coverage_report and not coverage_report.complete:
+        corrective_results = corrective_retrieval(toolbox=toolbox, query_plan=query_plan, missing=coverage_report.missing)
+        tool_results.extend(corrective_results)
+        evidence = evidence_from_tool_results(tool_results) or list(retrieved)
+        coverage_report = check_plan_coverage(query_plan, evidence)
+    if coverage_report:
+        trace.append(
+            trace_step(
+                "coverage_check",
+                summary=(
+                    "Coverage complete."
+                    if coverage_report.complete
+                    else f"Coverage incomplete for {len(coverage_report.missing)} entity-field pair(s)."
+                ),
+                coverage=coverage_report.to_dict(),
+                corrective_calls=len(corrective_results),
+            )
+        )
+
+    evidence = coverage_approved_evidence(evidence, coverage_report)
     evidence_sources = _sources_from_evidence(evidence)
     answer = None
     synthesis_mode = "extractive_rag"
-    if bool_env("ME_USE_LLM_ANSWER", default=False) or bool_env("ME_FORCE_LLM", default=False):
-        answer = compose_with_llm(query=query, plan=plan, evidence=evidence)
+    if bool_env("ME_USE_LLM_ANSWER", default=bool(env("DEEPSEEK_API_KEY"))) or bool_env("ME_FORCE_LLM", default=False):
+        answer = compose_with_llm(query=query, plan=plan, evidence=evidence, coverage_report=coverage_report)
         synthesis_mode = "llm_grounded" if answer else "extractive_after_llm_fallback"
     if not answer:
-        answer = compose_from_evidence(query=query, evidence=evidence)
+        answer = compose_from_evidence(query=query, evidence=evidence, query_plan=query_plan, coverage_report=coverage_report)
     trace.append(
         trace_step(
             "synthesize",
@@ -86,6 +104,7 @@ def generate_answer(
         sources=evidence_sources,
         tool_results=tool_results,
         evidence=evidence,
+        coverage_report=coverage_report,
     )
     trace.append(
         trace_step(
@@ -110,12 +129,28 @@ def plan_tool_calls(
     query: str,
     toolbox: ECUToolbox,
     route: Mapping[str, Any] | None = None,
+    query_plan: QueryPlan | None = None,
 ) -> AgentPlan:
-    if bool_env("ME_USE_LLM_PLANNER", default=False):
+    use_llm_planner = bool_env("ME_USE_LLM_PLANNER", default=bool(env("DEEPSEEK_API_KEY")))
+    use_llm_tool_planner = use_llm_planner and bool_env("ME_USE_LLM_TOOL_PLANNER", default=True)
+    if use_llm_tool_planner:
         llm_plan = plan_with_llm(query=query, toolbox=toolbox, route=route)
-        if llm_plan and llm_plan.calls:
-            return complete_plan(query=query, route=route, plan=llm_plan)
-    return AgentPlan(rationale="RAG planner selected semantic document retrieval.", calls=[_search_call(query, route)])
+        if llm_plan is not None:
+            sanitized = sanitize_plan(query=query, route=route, toolbox=toolbox, plan=llm_plan)
+            if sanitized.calls:
+                return ensure_search_call(query=query, route=route, query_plan=query_plan, plan=sanitized)
+
+    calls: list[ToolCall] = []
+    if query_plan and query_plan.entities and query_plan.attribute:
+        calls.extend(
+            [
+                ToolCall("get_model_field_evidence", {"models": query_plan.entities, "field": query_plan.attribute}),
+                ToolCall("check_evidence_coverage", {"models": query_plan.entities, "field": query_plan.attribute}),
+            ]
+        )
+    calls.append(_search_call(query, route, query_plan=query_plan))
+    plan = AgentPlan(rationale="RAG controller selected evidence retrieval tools.", calls=calls)
+    return sanitize_plan(query=query, route=route, toolbox=toolbox, plan=plan)
 
 
 def plan_with_llm(
@@ -158,6 +193,61 @@ def complete_plan(query: str, route: Mapping[str, Any] | None, plan: AgentPlan) 
     return AgentPlan(rationale=f"{plan.rationale} Plan normalized to the RAG retrieval contract.", calls=calls)
 
 
+def ensure_search_call(
+    *,
+    query: str,
+    route: Mapping[str, Any] | None,
+    query_plan: QueryPlan | None,
+    plan: AgentPlan,
+) -> AgentPlan:
+    calls = list(plan.calls)
+    if not any(call.name == "search_documents" for call in calls):
+        calls.append(_search_call(query, route, query_plan=query_plan))
+    return AgentPlan(rationale=f"{plan.rationale} Plan normalized to the RAG retrieval contract.", calls=calls)
+
+
+def sanitize_plan(
+    *,
+    query: str,
+    route: Mapping[str, Any] | None,
+    toolbox: ECUToolbox,
+    plan: AgentPlan,
+) -> AgentPlan:
+    manifest = {tool["name"]: tool for tool in toolbox.manifest()}
+    sanitized: list[ToolCall] = []
+    for call in plan.calls:
+        if call.name not in manifest:
+            continue
+        allowed = set((manifest[call.name].get("input_schema") or {}).get("properties") or {})
+        arguments = {key: value for key, value in call.arguments.items() if key in allowed}
+        if call.name == "search_documents":
+            arguments = _sanitize_search_arguments(query=query, route=route, arguments=arguments)
+        elif call.name == "list_sources":
+            arguments = {}
+        sanitized.append(ToolCall(name=call.name, arguments=arguments))
+    return AgentPlan(rationale=plan.rationale, calls=sanitized)
+
+
+def _sanitize_search_arguments(
+    *,
+    query: str,
+    route: Mapping[str, Any] | None,
+    arguments: Mapping[str, Any],
+) -> dict[str, Any]:
+    sanitized: dict[str, Any] = {"query": str(arguments.get("query") or query)}
+    route_models = list((route or {}).get("models") or ())
+    for key in ("models", "series", "fields", "sources"):
+        values = _as_string_list(arguments.get(key))
+        if values:
+            sanitized[key] = values
+    if arguments.get("field"):
+        sanitized["field"] = str(arguments["field"])
+    if route_models and not sanitized.get("models"):
+        sanitized["models"] = route_models
+    sanitized["top_k"] = _clamp_top_k(arguments.get("top_k"), default=10)
+    return sanitized
+
+
 def execute_plan(toolbox: ECUToolbox, plan: AgentPlan) -> list[ToolResult]:
     results: list[ToolResult] = []
     allowed = {tool["name"] for tool in toolbox.manifest()}
@@ -190,7 +280,12 @@ def tool_result_summary(result: ToolResult) -> dict[str, Any]:
     }
 
 
-def compose_with_llm(query: str, plan: AgentPlan, evidence: Sequence[RetrievalResult]) -> str | None:
+def compose_with_llm(
+    query: str,
+    plan: AgentPlan,
+    evidence: Sequence[RetrievalResult],
+    coverage_report: CoverageReport | None = None,
+) -> str | None:
     messages = [
         {
             "role": "system",
@@ -207,6 +302,7 @@ def compose_with_llm(query: str, plan: AgentPlan, evidence: Sequence[RetrievalRe
                 {
                     "question": query,
                     "plan_rationale": plan.rationale,
+                    "coverage": coverage_report.to_dict() if coverage_report else None,
                     "retrieved_evidence": [evidence_to_dict(item) for item in evidence],
                 },
                 ensure_ascii=False,
@@ -216,12 +312,19 @@ def compose_with_llm(query: str, plan: AgentPlan, evidence: Sequence[RetrievalRe
     return chat_with_configured_llm(messages, temperature=0.0)
 
 
-def compose_from_evidence(query: str, evidence: Sequence[RetrievalResult]) -> str:
-    if _is_unsupported_subjective_query(query):
-        return (
-            "The internal ECU documentation does not contain enough evidence about subjective appearance, "
-            "industrial design, color, or visual preference to answer this question."
-        )
+def compose_from_evidence(
+    query: str,
+    evidence: Sequence[RetrievalResult],
+    query_plan: QueryPlan | None = None,
+    coverage_report: CoverageReport | None = None,
+) -> str:
+    if coverage_report and coverage_report.items:
+        return compose_from_coverage(query_plan=query_plan, coverage_report=coverage_report)
+
+    structured_answer = compose_structured_evidence_answer(evidence=evidence, query_plan=query_plan)
+    if structured_answer:
+        return structured_answer
+
     missing_models = requested_models_without_evidence(query, evidence)
     if missing_models:
         return (
@@ -239,6 +342,106 @@ def compose_from_evidence(query: str, evidence: Sequence[RetrievalResult]) -> st
     return "Relevant documentation evidence:\n" + "\n".join(bullets)
 
 
+def compose_structured_evidence_answer(
+    *,
+    evidence: Sequence[RetrievalResult],
+    query_plan: QueryPlan | None = None,
+) -> str | None:
+    rows = [item for item in evidence if item.metadata.get("chunk_type") == "field" and item.metadata.get("field")]
+    if not rows:
+        return None
+
+    entities = query_plan.entities if query_plan else []
+    if entities:
+        rows = [item for item in rows if item.metadata.get("model") in entities]
+    if not rows:
+        return None
+
+    by_field: dict[str, list[RetrievalResult]] = {}
+    for item in rows:
+        field = item.metadata.get("field", "")
+        by_field.setdefault(field, [])
+        by_field[field].append(item)
+
+    selected = select_field_groups(by_field, limit=8, entities=entities)
+    lines = ["Grounded answer from retrieved ECU documentation:"]
+    for field, field_rows in selected:
+        rows_by_model: dict[str, RetrievalResult] = {}
+        for row in sorted(field_rows, key=lambda item: item.score, reverse=True):
+            rows_by_model.setdefault(row.metadata.get("model", ""), row)
+        if not rows_by_model:
+            continue
+
+        ordered_models = entities or sorted(rows_by_model)
+        values = []
+        for entity in ordered_models:
+            row = rows_by_model.get(entity)
+            if row is None:
+                continue
+            value = row.metadata.get("value") or _evidence_excerpt(row.content, max_chars=120)
+            source = row.metadata.get("source", "unknown")
+            values.append(f"{entity}: {value} (Source: {source})")
+        if values:
+            label = field_rows[0].metadata.get("field_label") or field.replace("_", " ")
+            lines.append(f"- {label}: " + "; ".join(values))
+    for context in nearby_section_context(evidence):
+        source = context.metadata.get("source", "unknown")
+        lines.append(f"- Context from {source}: {_evidence_excerpt(context.content, max_chars=420)}")
+    return "\n".join(lines) if len(lines) > 1 else None
+
+
+def nearby_section_context(evidence: Sequence[RetrievalResult], *, max_items: int = 2) -> list[RetrievalResult]:
+    if not evidence:
+        return []
+    top_score = max(item.score for item in evidence)
+    contexts = [
+        item
+        for item in evidence
+        if item.metadata.get("chunk_type") == "section" and item.score >= top_score - 0.08
+    ]
+    return sorted(contexts, key=lambda item: item.score, reverse=True)[:max_items]
+
+
+def select_field_groups(
+    by_field: Mapping[str, Sequence[RetrievalResult]],
+    *,
+    limit: int,
+    entities: Sequence[str] | None = None,
+) -> list[tuple[str, Sequence[RetrievalResult]]]:
+    ranked = sorted(by_field.items(), key=_field_group_score, reverse=True)
+    if not ranked:
+        return []
+
+    top_score = _field_group_score(ranked[0])[0]
+    if _field_group_score(ranked[0])[1] > 1:
+        return ranked[:1]
+    if entities:
+        if len(entities) > 1:
+            return ranked[:limit]
+        close_groups = [item for item in ranked if top_score - _field_group_score(item)[0] <= 0.12]
+        return (close_groups or ranked)[:limit]
+    close_groups = [item for item in ranked if top_score - _field_group_score(item)[0] <= 0.12]
+    return (close_groups or ranked)[:limit]
+
+
+def compose_from_coverage(query_plan: QueryPlan | None, coverage_report: CoverageReport) -> str:
+    attribute = coverage_report.attribute or (query_plan.attribute if query_plan else "requested field")
+    if not coverage_report.complete:
+        missing = ", ".join(f"{item['entity']} {item['attribute']}" for item in coverage_report.missing)
+        return f"The internal ECU documentation does not contain enough evidence for: {missing}."
+
+    title = f"{attribute.replace('_', ' ').title()} evidence"
+    lines = [f"{title}:"]
+    for item in coverage_report.items:
+        if not item.evidence:
+            continue
+        evidence = item.evidence[0]
+        value = evidence.get("value") or _evidence_excerpt(evidence.get("content", ""), max_chars=220)
+        source = evidence.get("source", "unknown")
+        lines.append(f"- {item.entity}: {value} (Source: {source})")
+    return "\n".join(lines)
+
+
 def apply_grounding_checks(
     *,
     query: str,
@@ -246,6 +449,7 @@ def apply_grounding_checks(
     sources: list[str],
     tool_results: Sequence[ToolResult],
     evidence: Sequence[RetrievalResult],
+    coverage_report: CoverageReport | None = None,
 ) -> tuple[str, float]:
     has_missing_evidence = "not contain enough" in answer.lower() or "could not find" in answer.lower()
     confidence = 0.45 if has_missing_evidence else 0.62
@@ -262,10 +466,10 @@ def apply_grounding_checks(
             f"{', '.join(unsupported_claims)} in the retrieved evidence."
         )
 
-    if _is_unsupported_subjective_query(query):
-        confidence = min(confidence, 0.45)
     if requested_models_without_evidence(query, evidence):
         confidence = min(confidence, 0.45)
+    if coverage_report and coverage_report.items:
+        confidence = min(confidence, 0.45) if not coverage_report.complete else max(confidence, 0.95)
     if sources and "source:" not in answer.lower() and "source" not in answer.lower():
         answer = f"{answer}\nsource: {', '.join(sources)}"
     return answer, confidence
@@ -275,7 +479,27 @@ def evidence_from_tool_results(tool_results: Sequence[ToolResult]) -> list[Retri
     evidence: list[RetrievalResult] = []
     for result in tool_results:
         evidence.extend(retrieval_results_from_tool(result))
+        evidence.extend(structured_retrieval_results_from_tool(result))
     return _dedupe_evidence(evidence)
+
+
+def structured_retrieval_results_from_tool(result: ToolResult) -> list[RetrievalResult]:
+    if result.name != "get_model_field_evidence" or not isinstance(result.result, list):
+        return []
+    retrievals = []
+    for row in result.result:
+        if not isinstance(row, dict):
+            continue
+        metadata = {str(key): str(value) for key, value in row.items()}
+        metadata["chunk_type"] = "field"
+        content = (
+            f"Model: {metadata.get('model', '')}\n"
+            f"Field: {metadata.get('field_label') or metadata.get('field', '')}\n"
+            f"Value: {metadata.get('value', '')}\n"
+            f"Source: {metadata.get('source', '')}"
+        )
+        retrievals.append(RetrievalResult(content=content, metadata=metadata, score=1.0))
+    return retrievals
 
 
 def evidence_to_dict(item: RetrievalResult) -> dict[str, Any]:
@@ -286,14 +510,6 @@ def evidence_to_dict(item: RetrievalResult) -> dict[str, Any]:
     }
 
 
-def models_in_query(query: str) -> list[str]:
-    models = []
-    for match in re.findall(r"(?<![A-Za-z0-9])ecu[-\s]?(\d+[a-z]?)(?![A-Za-z0-9])", query, flags=re.IGNORECASE):
-        model = f"ECU-{match.upper()}"
-        models.append(MODEL_ALIASES.get(model.upper(), _canonical_model_case(model)))
-    return _dedupe(models)
-
-
 def requested_models_without_evidence(query: str, evidence: Sequence[RetrievalResult]) -> list[str]:
     requested = models_in_query(query)
     if not requested:
@@ -302,16 +518,67 @@ def requested_models_without_evidence(query: str, evidence: Sequence[RetrievalRe
     return [model for model in requested if model not in available]
 
 
-def _search_call(query: str, route: Mapping[str, Any] | None) -> ToolCall:
+def _search_call(query: str, route: Mapping[str, Any] | None, query_plan: QueryPlan | None = None) -> ToolCall:
     models = list((route or {}).get("models") or ())
-    return ToolCall("search_documents", {"query": query, "models": models, "top_k": 10})
+    arguments: dict[str, Any] = {"query": query, "models": models, "top_k": 10}
+    if query_plan and query_plan.attribute:
+        arguments["field"] = query_plan.attribute
+    return ToolCall("search_documents", arguments)
 
 
-def _canonical_model_case(model: str) -> str:
-    prefix, _, suffix = model.partition("-")
-    if suffix.lower().endswith("b"):
-        return f"{prefix.upper()}-{suffix[:-1]}b"
-    return model.upper()
+def corrective_retrieval(
+    *,
+    toolbox: ECUToolbox,
+    query_plan: QueryPlan,
+    missing: Sequence[Mapping[str, str]],
+) -> list[ToolResult]:
+    results = []
+    for item in missing:
+        entity = item.get("entity") or item.get("model")
+        attribute = item.get("attribute") or query_plan.attribute
+        if not entity or not attribute:
+            continue
+        results.append(
+            toolbox.search_documents(
+                query=f"{entity} {attribute.replace('_', ' ')} specification",
+                models=[entity],
+                field=attribute,
+                top_k=3,
+            )
+        )
+    return results
+
+
+def coverage_approved_evidence(
+    evidence: Sequence[RetrievalResult],
+    coverage_report: CoverageReport | None,
+) -> list[RetrievalResult]:
+    if not coverage_report or not coverage_report.items:
+        return list(evidence)
+    approved = []
+    for item in coverage_report.items:
+        for result in evidence:
+            if result.metadata.get("model") == item.entity and result.metadata.get("field"):
+                approved.append(result)
+    return _dedupe_evidence(approved)
+
+
+def _as_string_list(value: Any) -> list[str]:
+    if value is None:
+        return []
+    if isinstance(value, str):
+        return [value]
+    if isinstance(value, Sequence) and not isinstance(value, (bytes, bytearray)):
+        return [str(item) for item in value if item]
+    return [str(value)]
+
+
+def _clamp_top_k(value: Any, default: int) -> int:
+    try:
+        top_k = int(value)
+    except (TypeError, ValueError):
+        top_k = default
+    return max(1, min(10, top_k))
 
 
 def _dedupe_evidence(evidence: Sequence[RetrievalResult]) -> list[RetrievalResult]:
@@ -337,25 +604,11 @@ def _evidence_excerpt(content: str, max_chars: int = 1_400) -> str:
     return excerpt[: max_chars - 3].rstrip() + "..."
 
 
-def _is_unsupported_subjective_query(query: str) -> bool:
-    lowered = query.lower()
-    subjective_terms = (
-        "look better",
-        "better looking",
-        "appearance",
-        "aesthetic",
-        "visual",
-        "color",
-        "industrial design",
-        "好看",
-        "漂亮",
-        "美观",
-        "外观",
-        "颜值",
-        "颜色",
-        "造型",
-    )
-    return any(term in lowered for term in subjective_terms)
+def _field_group_score(item: tuple[str, Sequence[RetrievalResult]]) -> tuple[float, int]:
+    _field, rows = item
+    best_score = max((row.score for row in rows), default=0.0)
+    model_count = len({row.metadata.get("model", "") for row in rows})
+    return best_score, model_count
 
 
 def _contains_numeric_or_command(answer: str) -> bool:

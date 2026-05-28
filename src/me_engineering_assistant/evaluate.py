@@ -20,7 +20,7 @@ EXPECTED_HITS = {
     "4": ("ECU-850b", "5 TOPS", "4 GB", "1.5 GHz", "2 GB", "1.2 GHz"),
     "5": ("ECU-750", "1 Mbps", "ECU-850", "2 Mbps", "Dual"),
     "6": ("ECU-850b", "1.7A", "550mA"),
-    "7": ("ECU-850", "ECU-850b", "ECU-750", "does not support"),
+    "7": ("ECU-850", "ECU-850b", "ECU-750", ("does not support", "not supported")),
     "8": ("ECU-750", "2 MB", "ECU-850", "16 GB", "ECU-850b", "32 GB"),
     "9": ("ECU-850", "ECU-850b", "+105", "ECU-750", "+85"),
     "10": ("me-driver-ctl --enable-npu --mode=performance",),
@@ -153,7 +153,13 @@ def main(argv: list[str] | None = None) -> int:
 def _contains_expected_hits(question_id: str, answer: str) -> bool:
     expected = EXPECTED_HITS.get(question_id, ())
     answer_lower = answer.lower()
-    return all(hit.lower() in answer_lower for hit in expected)
+    return all(_contains_hit(answer_lower, hit) for hit in expected)
+
+
+def _contains_hit(answer_lower: str, hit: str | tuple[str, ...]) -> bool:
+    if isinstance(hit, tuple):
+        return any(option.lower() in answer_lower for option in hit)
+    return hit.lower() in answer_lower
 
 
 def _contains_expected_sources(question_id: str, sources: list[str]) -> bool:

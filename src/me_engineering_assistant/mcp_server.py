@@ -38,21 +38,48 @@ def create_mcp_server(
     )
 
     @server.tool()
+    # pylint: disable=too-many-positional-arguments
     def search_documents(
         query: str,
         models: list[str] | None = None,
+        series: list[str] | None = None,
+        field: str | None = None,
+        fields: list[str] | None = None,
         sources: list[str] | None = None,
         top_k: int = 6,
     ) -> dict[str, Any]:
         """Search internal ECU documentation chunks for grounding evidence."""
         if top_k < 1 or top_k > 10:
             raise ToolError("top_k must be between 1 and 10")
-        return toolbox.search_documents(query=query, models=models, sources=sources, top_k=top_k).to_dict()
+        return toolbox.search_documents(
+            query=query,
+            models=models,
+            series=series,
+            field=field,
+            fields=fields,
+            sources=sources,
+            top_k=top_k,
+        ).to_dict()
 
     @server.tool()
     def list_sources() -> dict[str, Any]:
         """List source documents available in the indexed internal documentation."""
         return toolbox.list_sources().to_dict()
+
+    @server.tool()
+    def get_document_catalog() -> dict[str, Any]:
+        """Return the indexed ECU document catalog."""
+        return toolbox.get_document_catalog().to_dict()
+
+    @server.tool()
+    def get_model_field_evidence(models: list[str] | None = None, field: str | None = None) -> dict[str, Any]:
+        """Return structured model-field evidence extracted from source documents."""
+        return toolbox.get_model_field_evidence(models=models, field=field).to_dict()
+
+    @server.tool()
+    def check_evidence_coverage(models: list[str], field: str) -> dict[str, Any]:
+        """Check whether each requested model has structured evidence for a field."""
+        return toolbox.check_evidence_coverage(models=models, field=field).to_dict()
 
     @server.resource("ecu://sources")
     def sources_resource() -> str:

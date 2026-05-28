@@ -31,18 +31,22 @@ class AgentTests(unittest.TestCase):
     def test_routes_comparison_queries_to_multiple_sources(self) -> None:
         route = route_query("Compare the CAN bus capabilities of ECU-750 and ECU-850.")
 
-        self.assertEqual(route.mode, "multi_source")
+        self.assertEqual(route.mode, "metadata_filtered")
         self.assertEqual(route.models, ["ECU-750", "ECU-850"])
 
     def test_answers_key_acceptance_questions(self) -> None:
         temp = self.agent.answer("What is the maximum operating temperature for the ECU-750?")
         can = self.agent.answer("Compare the CAN bus capabilities of ECU-750 and ECU-850.")
         command = self.agent.answer("How do you enable the NPU on the ECU-850b?")
+        storage = self.agent.answer("How does the storage capacity compare across all ECU models?")
 
         self.assertIn("+85", temp.answer)
         self.assertIn("1 Mbps", can.answer)
         self.assertIn("2 Mbps", can.answer)
         self.assertIn("me-driver-ctl --enable-npu --mode=performance", command.answer)
+        self.assertIn("ECU-750: 2 MB Internal Flash", storage.answer)
+        self.assertIn("ECU-850: 16 GB eMMC", storage.answer)
+        self.assertIn("ECU-850b: 32 GB eMMC", storage.answer)
 
     def test_golden_evaluation_passes_acceptance_threshold(self) -> None:
         report = evaluate_golden(self.agent, load_questions(ROOT / "test-questions.csv"))

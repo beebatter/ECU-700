@@ -12,6 +12,7 @@ logs/
 review_queue*.jsonl
 evaluation_report*.json
 agent_trace*.md
+.me_engineering_memory.sqlite*
 build/
 dist/
 *.egg-info/

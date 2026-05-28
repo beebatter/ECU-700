@@ -10,7 +10,7 @@ ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "src"))
 
 # pylint: disable=wrong-import-position
-from me_engineering_assistant.model import ECUAssistantPyFunc
+from me_engineering_assistant.model import ECUAssistantPyFunc, coerce_prediction_requests
 
 
 class ModelTests(unittest.TestCase):
@@ -42,6 +42,17 @@ class ModelTests(unittest.TestCase):
         self.assertEqual(len(result), 2)
         self.assertIn("1.7A", result[0]["answer"])
         self.assertIn("ECU-750", result[1]["answer"])
+
+    def test_prediction_requests_accept_session_ids(self) -> None:
+        requests, single = coerce_prediction_requests(
+            {
+                "query": ["How much RAM does ECU-850 have?", "What about the plus version?"],
+                "session_id": "demo",
+            }
+        )
+
+        self.assertFalse(single)
+        self.assertEqual([request.session_id for request in requests], ["demo", "demo"])
 
 
 if __name__ == "__main__":

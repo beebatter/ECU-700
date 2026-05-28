@@ -45,7 +45,7 @@ class ObservabilityTests(unittest.TestCase):
                 self.assertEqual(records[0]["event_type"], "agent_response")
                 self.assertEqual(records[0]["query"], "How much RAM does the ECU-850 have?")
                 self.assertEqual(records[0]["sources"], response.sources)
-                self.assertEqual(records[0]["retriever_backend"], "sentence-transformers-faiss")
+                self.assertEqual(records[0]["retriever_backend"], "hybrid-sentence-transformers-faiss-bm25")
                 self.assertIn("trace", records[0])
                 self.assertFalse(records[0]["detectors"]["missing_sources"])
             finally:

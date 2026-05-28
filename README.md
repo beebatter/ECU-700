@@ -4,30 +4,46 @@ This project implements the ECU engineering coding challenge as a small Python
 package instead of a notebook. It provides a LangGraph-style RAG agent that can
 route questions across the ECU-700 and ECU-800 Markdown specifications, return
 answers with sources, validate against the supplied golden questions, and run
-locally with optional DeepSeek LLM generation and local FAISS retrieval.
+locally with optional DeepSeek LLM generation and local hybrid retrieval.
 
 ## Architecture
 
-The runtime flow is standard RAG:
+The runtime flow is hybrid RAG with optional application-layer memory:
 
-`User query -> route_query -> retrieve chunks -> search_documents tool -> grounded synthesis -> validate -> answer`
+`User query -> load_memory -> query_plan -> hybrid retrieve -> coverage check -> corrective retrieval -> grounded synthesis -> validate -> reflect_memory -> answer`
 
 - `documents.py` loads the three Markdown documents and chunks by headings and
-  paragraphs. It intentionally does not depend on strict Markdown table parsing,
-  because the ECU-700 CAN row is malformed in the source file.
-- `retriever.py` uses one retrieval path: `sentence-transformers` creates
-  normalized embeddings and FAISS performs in-memory inner-product similarity
-  search over the document chunks.
-- `graph.py` builds the four-node LangGraph workflow when `langgraph` is
-  installed. The same node functions run locally without LangGraph so the
-  package remains testable in lightweight environments.
+  paragraphs, then creates field-level chunks from table/spec rows. Field
+  metadata is dynamic and comes from source labels such as `Storage`, not from
+  golden-test question handlers.
+- `retriever.py` uses one hybrid retrieval path: `sentence-transformers` creates
+  normalized embeddings, FAISS performs dense similarity search, `rank-bm25`
+  provides sparse keyword scoring, and a local reranker combines dense, sparse,
+  metadata, and field matches.
+- `planner.py` produces a structured retrieval plan without hard-coded intent
+  categories. With an LLM enabled, the model proposes entities, optional fields,
+  and subqueries from the document catalog. Without an LLM, the fallback only
+  links explicit ECU model/series mentions to metadata and leaves the query broad
+  for retrieval.
+- `coverage.py` checks whether each requested model-field pair has grounded
+  evidence and triggers corrective retrieval before answer generation.
+- `graph.py` builds the LangGraph workflow when `langgraph` is installed. The
+  same node functions run locally without LangGraph so the package remains
+  testable in lightweight environments.
+- `memory.py`, `conversation.py`, and `reflection.py` add optional multi-turn
+  memory outside the retrieval core. Short-term memory is recent turns,
+  mid-term memory is a per-session summary, and long-term memory is a small
+  SQLite table of stable preferences or project decisions. Reflection redacts
+  secrets before anything is persisted.
 - `answering.py` implements the RAG answer controller. It does not maintain a
-  growing list of specification fields or one function per expected user
-  question. Every query follows the same rule: retrieve relevant chunks, compose
-  an answer only from those chunks, and fall back to an insufficient-evidence
-  answer when the retrieved documentation does not support the request.
+  growing list of intent handlers, specification-specific synthesizers, or
+  one function per expected user question. Every query follows the same rule:
+  execute the query plan, retrieve evidence, verify coverage when the plan names
+  a field, compose only from returned evidence, and rely on grounded LLM
+  synthesis for open-ended intent judgment when enabled.
 - `tools.py` exposes the internal functions available to the agent:
-  `search_documents` and `list_sources`.
+  `search_documents`, `get_document_catalog`, `get_model_field_evidence`,
+  `check_evidence_coverage`, and `list_sources`.
 - `mcp_server.py` runs a real Model Context Protocol server using the official
   Python SDK. MCP clients can discover and call the same ECU tools over stdio or
   Streamable HTTP.
@@ -35,14 +51,17 @@ The runtime flow is standard RAG:
   final answers are constrained to tool evidence and source filenames.
 - `model.py` wraps the agent as an `mlflow.pyfunc.PythonModel` with a `predict`
   method that accepts strings, dictionaries, lists, or dataframe-like inputs.
+  Requests may include `session_id` when memory is enabled.
 
 The anti-hallucination guardrails are intentionally simple and inspectable:
 
-- the LLM planner may only return tool calls, not final facts;
+- the LLM planner may only create a structured retrieval plan, not final facts;
 - the final answer is generated from returned tool evidence;
+- entity-field coverage is checked before high-confidence comparative answers;
 - answers include source filenames from the internal documentation;
 - numeric values and commands are checked against tool evidence;
-- subjective or unsupported criteria are not guessed from unrelated specs;
+- unsupported criteria are handled by grounded LLM synthesis when enabled, and
+  unsupported models reduce confidence in deterministic fallback mode;
 - missing evidence or unsupported ECU models reduce confidence and can trigger
   the human review queue.
 
@@ -63,6 +82,28 @@ PYTHONPATH=src python3 -m me_engineering_assistant
 The prompt asks `Question>`; type a question and the assistant prints separated
 `Answer`, `Sources`, and `Confidence` sections instead of raw JSON.
 
+Interactive CLI memory is enabled by default. The default session id is
+`default`, so follow-up questions can use the recent conversation and future CLI
+runs can reuse the same session summary:
+
+```bash
+PYTHONPATH=src python3 -m me_engineering_assistant --session-id ecu-demo
+```
+
+Memory is stored in SQLite at `.me_engineering_memory.sqlite` unless overridden:
+
+```bash
+PYTHONPATH=src python3 -m me_engineering_assistant \
+  --session-id ecu-demo \
+  --memory-db .local/ecu-memory.sqlite
+```
+
+Disable memory for a stateless run:
+
+```bash
+PYTHONPATH=src python3 -m me_engineering_assistant --no-memory "How much RAM does ECU-850 have?"
+```
+
 Run the golden evaluation:
 
 ```bash
@@ -75,8 +116,9 @@ Run the unit tests:
 PYTHONPATH=src python3 -m unittest discover -s tests -v
 ```
 
-The local retriever requires `sentence-transformers` and `faiss-cpu`. For local
-LLM configuration, copy `.env.example` to `.env` and fill in your own key:
+The local retriever requires `sentence-transformers`, `faiss-cpu`, and
+`rank-bm25`. For local LLM configuration, copy `.env.example` to `.env` and
+fill in your own key:
 
 ```bash
 cp .env.example .env
@@ -85,20 +127,25 @@ $EDITOR .env
 
 Do not commit `.env`. It is ignored by git.
 
-DeepSeek is used for chat/completion calls here. Embeddings are local via
-`sentence-transformers` + FAISS because this project does not rely on a DeepSeek
-embedding model.
+DeepSeek is used for chat/completion calls here. Embeddings and sparse retrieval
+are local via `sentence-transformers` + FAISS + BM25 because this project does
+not rely on a DeepSeek embedding model.
 
-DeepSeek can be used as the planning model, the final synthesis model, or both.
-For the most agentic local demo, enable planner and grounded answer synthesis:
+DeepSeek is the default LLM path when `DEEPSEEK_API_KEY` is set. The sample
+configuration enables LLM query planning, LLM tool planning, and grounded LLM
+answer synthesis:
 
 ```bash
-ME_USE_LLM_PLANNER=true ME_USE_LLM_ANSWER=true PYTHONPATH=src python3 -m me_engineering_assistant \
+ME_USE_LLM_PLANNER=true ME_USE_LLM_TOOL_PLANNER=true ME_USE_LLM_ANSWER=true ME_FORCE_LLM=true \
+PYTHONPATH=src python3 -m me_engineering_assistant \
   "Summarize the differences between ECU-850 and ECU-850b."
 ```
 
-For deterministic offline tests, leave those flags as `false`; the same RAG
-retrieval tool is still used through the local fallback planner.
+For deterministic offline tests, set those flags to `false`; the same RAG
+retrieval tool is still used through the local fallback planner, but no
+question-type or field-keyword classifier is used. `ME_USE_LLM_TOOL_PLANNER`
+is gated by `ME_USE_LLM_PLANNER`, so disabling planner also disables LLM tool
+planning.
 
 To inspect the agent process, enable trace output:
 
@@ -171,6 +218,9 @@ PYTHONPATH=src python -m me_engineering_assistant.mcp_server \
 The server exposes these MCP tools:
 
 - `search_documents`: retrieve source chunks from ECU manuals;
+- `get_document_catalog`: list indexed source documents with model metadata;
+- `get_model_field_evidence`: inspect structured model-field evidence;
+- `check_evidence_coverage`: verify model-field coverage before answering;
 - `list_sources`: list indexed ECU source documents.
 
 It also exposes resources:
@@ -200,8 +250,8 @@ Install local development dependencies with:
 python -m pip install -e ".[dev,mcp]"
 ```
 
-The package targets Python 3.10-3.13 because the local FAISS and
-sentence-transformers stack is the only supported retrieval path.
+The package targets Python 3.10-3.13 because the local FAISS,
+sentence-transformers, and BM25 stack is the only supported retrieval path.
 
 For the full Databricks/LangChain/MLflow environment, install:
 
@@ -279,7 +329,9 @@ documentation release.
 ## Limitations and Future Work
 
 - The current corpus is tiny, so an in-memory vector store is sufficient.
-- Router rules are tuned to the ECU-750, ECU-850, and ECU-850b naming scheme.
+- Entity linking currently recognizes explicit ECU model/series identifiers from
+  the indexed catalog. Open-ended intent understanding should use the LLM
+  planner and grounded answer synthesis.
 - Large-scale use should replace the in-memory store with a persistent vector
   index, add incremental re-indexing, and introduce document version metadata.
 - Human review can be added for low-confidence answers or queries that mention

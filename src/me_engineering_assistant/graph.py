@@ -1,25 +1,34 @@
 from __future__ import annotations
 
-import re
 import time
 from dataclasses import asdict, dataclass
 from pathlib import Path
 from typing import Any, Mapping, Sequence, TypedDict
 
-from me_engineering_assistant.answering import AnswerDraft, generate_answer, models_in_query
-from me_engineering_assistant.documents import chunk_documents, load_source_documents
+from me_engineering_assistant.answering import AnswerDraft, generate_answer
+from me_engineering_assistant.config import bool_env
+from me_engineering_assistant.conversation import DEFAULT_SESSION_ID, ConversationManager
+from me_engineering_assistant.documents import (
+    build_document_catalog,
+    build_model_field_table,
+    chunk_documents,
+    load_source_documents,
+)
+from me_engineering_assistant.memory import GLOBAL_SCOPE, MemoryStore
 from me_engineering_assistant.observability import log_agent_response
+from me_engineering_assistant.planner import QueryPlan, models_from_catalog, plan_query
 from me_engineering_assistant.review import maybe_enqueue_review
 from me_engineering_assistant.retriever import InMemoryECURetriever, RetrievalResult
 from me_engineering_assistant.tools import ECUToolbox
 from me_engineering_assistant.visualization import trace_step
 
 
-ALL_MODELS = ("ECU-750", "ECU-850", "ECU-850b")
-
-
 class GraphState(TypedDict, total=False):
     query: str
+    effective_query: str
+    session_id: str
+    memory_context: dict[str, Any]
+    query_plan: dict[str, Any]
     route: dict[str, Any]
     retrieved: list[dict[str, Any]]
     draft: dict[str, Any]
@@ -75,35 +84,14 @@ class AgentResponse:
 
 
 def route_query(query: str) -> RouteDecision:
-    lowered = query.lower()
-    models = models_in_query(query)
-    reasons: list[str] = []
-
-    if models:
-        reasons.append("explicit_model_reference")
-
-    if _is_global_query(lowered):
-        models = list(ALL_MODELS)
-        reasons.append("global_or_availability_question")
-    elif _is_comparison_query(lowered):
-        if not models:
-            models = list(ALL_MODELS)
-        reasons.append("comparison_question")
-    elif "800 series" in lowered:
-        models = ["ECU-850", "ECU-850b"]
-        reasons.append("series_reference")
-
-    series = sorted({model_to_series(model) for model in models})
-    mode = "single"
-    if len(models) > 1:
-        mode = "multi_source"
-    if set(models) == set(ALL_MODELS):
-        mode = "all_models"
-
-    return RouteDecision(mode=mode, models=models, series=series, reasons=reasons or ["semantic_retrieval"])
+    plan = plan_query(query, llm_enabled=False)
+    return _route_from_plan(plan)
 
 
-def model_to_series(model: str) -> str:
+def model_to_series(model: str, catalog=None) -> str:
+    for entry in catalog or ():
+        if entry.model == model:
+            return entry.series
     return "ECU-700" if model == "ECU-750" else "ECU-800"
 
 
@@ -111,20 +99,40 @@ class ECUAgent:
     def __init__(
         self,
         docs_dir: str | Path | None = None,
+        *,
+        memory_enabled: bool | None = None,
+        memory_store: MemoryStore | None = None,
+        memory_path: str | Path | None = None,
+        memory_scope: str = GLOBAL_SCOPE,
     ) -> None:
         self.docs_dir = Path(docs_dir).expanduser().resolve() if docs_dir else None
         self.documents = load_source_documents(base_path=self.docs_dir)
         self.chunks = chunk_documents(self.documents)
+        self.catalog = build_document_catalog(self.documents)
+        self.field_table = build_model_field_table(self.chunks)
         self.retriever = InMemoryECURetriever(self.chunks)
-        self.toolbox = ECUToolbox(self.retriever)
+        self.toolbox = ECUToolbox(self.retriever, catalog=self.catalog, field_table=self.field_table)
+        self.memory_enabled = bool_env("ME_MEMORY_ENABLED", default=False) if memory_enabled is None else memory_enabled
+        self.conversation: ConversationManager | None = None
+        if self.memory_enabled:
+            self.conversation = ConversationManager(
+                memory_store or MemoryStore(memory_path),
+                scope=memory_scope,
+            )
         self._workflow = self._build_langgraph_workflow()
 
-    def answer(self, query: str, include_trace: bool = False) -> AgentResponse:
+    def answer(
+        self,
+        query: str,
+        include_trace: bool = False,
+        session_id: str | None = None,
+    ) -> AgentResponse:
         started = time.perf_counter()
+        initial_state: GraphState = {"query": query, "session_id": session_id or DEFAULT_SESSION_ID}
         if self._workflow is not None:
-            state = self._workflow.invoke({"query": query})
+            state = self._workflow.invoke(initial_state)
         else:
-            state = self._run_without_langgraph({"query": query})
+            state = self._run_without_langgraph(initial_state)
 
         route = RouteDecision(**state["route"])
         trace = list(state.get("trace", []))
@@ -152,7 +160,14 @@ class ECUAgent:
         return self.answer(query).to_dict()
 
     def _run_without_langgraph(self, state: GraphState) -> GraphState:
-        for node in (self._route_node, self._retrieve_node, self._generate_node, self._validate_node):
+        for node in (
+            self._memory_node,
+            self._route_node,
+            self._retrieve_node,
+            self._generate_node,
+            self._validate_node,
+            self._reflect_memory_node,
+        ):
             state = node(state)
         return state
 
@@ -163,32 +178,72 @@ class ECUAgent:
             return None
 
         graph = StateGraph(GraphState)
+        graph.add_node("load_memory", self._memory_node)
         graph.add_node("route_query", self._route_node)
         graph.add_node("retrieve", self._retrieve_node)
         graph.add_node("generate", self._generate_node)
         graph.add_node("validate", self._validate_node)
-        graph.set_entry_point("route_query")
+        graph.add_node("reflect_memory", self._reflect_memory_node)
+        graph.set_entry_point("load_memory")
+        graph.add_edge("load_memory", "route_query")
         graph.add_edge("route_query", "retrieve")
         graph.add_edge("retrieve", "generate")
         graph.add_edge("generate", "validate")
-        graph.add_edge("validate", END)
+        graph.add_edge("validate", "reflect_memory")
+        graph.add_edge("reflect_memory", END)
         return graph.compile()
 
+    def _memory_node(self, state: GraphState) -> GraphState:
+        if self.conversation is None:
+            return state
+
+        session_id = str(state.get("session_id") or DEFAULT_SESSION_ID)
+        context = self.conversation.build_context(state["query"], session_id=session_id)
+        effective_query = self.conversation.enrich_query(state["query"], context)
+        trace = list(state.get("trace", []))
+        trace.append(
+            trace_step(
+                "load_memory",
+                summary=(
+                    f"Loaded memory for session {session_id}: "
+                    f"{len(context.recent_turns)} recent turn(s), {len(context.memories)} long-term memory item(s)."
+                ),
+                session_id=session_id,
+                has_summary=bool(context.summary),
+                recent_turns=len(context.recent_turns),
+                memories=[{"kind": memory.kind, "score": round(memory.score, 4)} for memory in context.memories],
+            )
+        )
+        return {
+            **state,
+            "session_id": session_id,
+            "memory_context": context.to_dict(),
+            "effective_query": effective_query,
+            "trace": trace,
+        }
+
     def _route_node(self, state: GraphState) -> GraphState:
-        route = route_query(state["query"])
+        query_plan = plan_query(
+            str(state.get("effective_query") or state["query"]),
+            catalog=self.catalog,
+            field_table=self.field_table,
+        )
+        route = _route_from_plan(query_plan, catalog=self.catalog)
         trace = list(state.get("trace", []))
         trace.append(
             trace_step(
                 "route_query",
                 summary=f"Route mode {route.mode}; models: {', '.join(route.models) or 'semantic retrieval'}.",
                 route=asdict(route),
+                query_plan=query_plan.to_dict(),
             )
         )
-        return {**state, "route": asdict(route), "trace": trace}
+        return {**state, "query_plan": query_plan.to_dict(), "route": asdict(route), "trace": trace}
 
     def _retrieve_node(self, state: GraphState) -> GraphState:
         route = RouteDecision(**state["route"])
-        results = self.retriever.retrieve(state["query"], filters=route.filters(), top_k=6)
+        query = str(state.get("effective_query") or state["query"])
+        results = self.retriever.retrieve(query, filters=route.filters(), top_k=6)
         retrieved = [result.to_dict() for result in results]
         trace = list(state.get("trace", []))
         trace.append(
@@ -209,6 +264,7 @@ class ECUAgent:
             self.toolbox,
             retrieved,
             route=state.get("route"),
+            query_plan=QueryPlan(**state["query_plan"]) if state.get("query_plan") else None,
         )
         trace = list(state.get("trace", []))
         trace.extend(draft.trace or [])
@@ -251,6 +307,34 @@ class ECUAgent:
             "trace": trace,
         }
 
+    def _reflect_memory_node(self, state: GraphState) -> GraphState:
+        if self.conversation is None:
+            return state
+
+        memory_context = state.get("memory_context") or {}
+        result = self.conversation.record_turn(
+            session_id=str(state.get("session_id") or DEFAULT_SESSION_ID),
+            query=state["query"],
+            answer=state["answer"],
+            confidence=float(state["confidence"]),
+            sources=list(state["sources"]),
+            previous_summary=str(memory_context.get("summary") or ""),
+        )
+        trace = list(state.get("trace", []))
+        trace.append(
+            trace_step(
+                "reflect_memory",
+                summary=(
+                    "Recorded turn and updated session memory; "
+                    f"stored {len(result.stored_memory_ids)} long-term memory item(s)."
+                ),
+                turn_index=result.turn.turn_index,
+                stored_memory_ids=result.stored_memory_ids,
+                updated_summary=bool(result.reflection.session_summary),
+            )
+        )
+        return {**state, "trace": trace}
+
 
 def _result_from_dict(item: Mapping[str, Any]) -> RetrievalResult:
     return RetrievalResult(
@@ -260,10 +344,13 @@ def _result_from_dict(item: Mapping[str, Any]) -> RetrievalResult:
     )
 
 
-def _is_comparison_query(query: str) -> bool:
-    return bool(re.search(r"\b(compare|comparison|differences?|versus|vs)\b", query))
-
-
-def _is_global_query(query: str) -> bool:
-    global_terms = ("across all", "all ecu", "which ecu", "which models", "support ota", "supports ota")
-    return any(term in query for term in global_terms)
+def _route_from_plan(plan: QueryPlan, catalog=None) -> RouteDecision:
+    series = sorted({model_to_series(model, catalog=catalog) for model in plan.entities})
+    known_models = models_from_catalog(catalog)
+    if not plan.entities:
+        mode = "semantic"
+    elif set(plan.entities) == set(known_models):
+        mode = "all_indexed_models"
+    else:
+        mode = "metadata_filtered"
+    return RouteDecision(mode=mode, models=plan.entities, series=series, reasons=plan.reasons)

@@ -30,7 +30,7 @@ class TraceTests(unittest.TestCase):
 
         self.assertEqual(
             step_names,
-            ["route_query", "retrieve", "plan", "execute_tools", "synthesize", "grounding", "validate"],
+            ["route_query", "retrieve", "plan", "execute_tools", "coverage_check", "synthesize", "grounding", "validate"],
         )
         self.assertIn("search_documents", str(plan_step["details"]["tool_calls"]))
 
