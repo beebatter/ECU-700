@@ -63,6 +63,19 @@ class DocumentTests(unittest.TestCase):
         self.assertIn("can_interface", fields)
         self.assertTrue({"operating_temperature", "operating_temp"} & fields)
 
+    def test_variant_inherits_base_feature_evidence(self) -> None:
+        chunks = chunk_documents(load_source_documents(base_path=ROOT))
+        field_table = build_model_field_table(chunks)
+        inherited_ota = [
+            row
+            for row in field_table
+            if row.model == "ECU-850b" and row.field == "ota_support"
+        ]
+
+        self.assertEqual(len(inherited_ota), 1)
+        self.assertIn("Inherited from base ECU-850", inherited_ota[0].value)
+        self.assertEqual(inherited_ota[0].source, "ECU-800_Series_Plus.md")
+
 
 if __name__ == "__main__":
     unittest.main()

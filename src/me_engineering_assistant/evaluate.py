@@ -4,6 +4,7 @@ import argparse
 import csv
 import json
 import math
+import re
 import time
 from dataclasses import dataclass
 from pathlib import Path
@@ -11,57 +12,28 @@ from typing import Iterable
 
 from me_engineering_assistant.documents import project_root
 from me_engineering_assistant.graph import ECUAgent
+from me_engineering_assistant.planner import models_in_query
 
 
-EXPECTED_HITS = {
-    "1": ("ECU-750", "+85"),
-    "2": ("ECU-850", "2 GB", "LPDDR4"),
-    "3": ("ECU-850b", "5 TOPS", "NPU"),
-    "4": ("ECU-850b", "5 TOPS", "4 GB", "1.5 GHz", "2 GB", "1.2 GHz"),
-    "5": ("ECU-750", "1 Mbps", "ECU-850", "2 Mbps", "Dual"),
-    "6": ("ECU-850b", "1.7A", "550mA"),
-    "7": ("ECU-850", "ECU-850b", "ECU-750", ("does not support", "not supported")),
-    "8": ("ECU-750", "2 MB", "ECU-850", "16 GB", "ECU-850b", "32 GB"),
-    "9": ("ECU-850", "ECU-850b", "+105", "ECU-750", "+85"),
-    "10": ("me-driver-ctl --enable-npu --mode=performance",),
-}
-
-EXPECTED_SOURCES = {
-    "1": ("ECU-700_Series_Manual.md",),
-    "2": ("ECU-800_Series_Base.md",),
-    "3": ("ECU-800_Series_Plus.md",),
-    "4": ("ECU-800_Series_Base.md", "ECU-800_Series_Plus.md"),
-    "5": ("ECU-700_Series_Manual.md", "ECU-800_Series_Base.md"),
-    "6": ("ECU-800_Series_Plus.md",),
-    "7": ("ECU-700_Series_Manual.md", "ECU-800_Series_Base.md", "ECU-800_Series_Plus.md"),
-    "8": ("ECU-700_Series_Manual.md", "ECU-800_Series_Base.md", "ECU-800_Series_Plus.md"),
-    "9": ("ECU-700_Series_Manual.md", "ECU-800_Series_Base.md", "ECU-800_Series_Plus.md"),
-    "10": ("ECU-800_Series_Plus.md",),
-}
-
-EXPECTED_ROUTE_MODELS = {
-    "1": ("ECU-750",),
-    "2": ("ECU-850",),
-    "3": ("ECU-850b",),
-    "4": ("ECU-850", "ECU-850b"),
-    "5": ("ECU-750", "ECU-850"),
-    "6": ("ECU-850b",),
-    "7": ("ECU-750", "ECU-850", "ECU-850b"),
-    "8": ("ECU-750", "ECU-850", "ECU-850b"),
-    "9": ("ECU-750", "ECU-850", "ECU-850b"),
-    "10": ("ECU-850b",),
-}
+PASS_SCORE_THRESHOLD = 0.45
 
 
 @dataclass(frozen=True)
 class EvaluationRow:
     question_id: str
     question: str
+    expected_answer: str
     answer: str
     passed: bool
+    score: float
+    matched_keywords: list[str]
     source_passed: bool
     route_passed: bool
     latency_seconds: float
+    llm_calls: int
+    llm_latency_seconds: float
+    retrieval_latency_seconds: float
+    generation_latency_seconds: float
     confidence: float
     sources: list[str]
     route_models: list[str]
@@ -82,18 +54,27 @@ def evaluate_golden(agent: ECUAgent, questions: Iterable[dict[str, str]]) -> dic
         started = time.perf_counter()
         response = agent.answer(row["Question"])
         latency = time.perf_counter() - started
-        passed = _contains_expected_hits(row["Question_ID"], response.answer)
-        source_passed = _contains_expected_sources(row["Question_ID"], response.sources)
-        route_passed = _contains_expected_route_models(row["Question_ID"], response.route.models)
+        score, matched_keywords = score_answer(row.get("Expected_Answer", ""), response.answer)
+        expected_models = expected_models_for_row(row, agent)
+        source_passed = expected_sources_match(expected_models, response.sources, agent)
+        route_passed = expected_route_match(expected_models, response.route.models)
+        passed = score >= PASS_SCORE_THRESHOLD and source_passed
         rows.append(
             EvaluationRow(
                 question_id=row["Question_ID"],
                 question=row["Question"],
+                expected_answer=row.get("Expected_Answer", ""),
                 answer=response.answer,
                 passed=passed,
+                score=score,
+                matched_keywords=matched_keywords,
                 source_passed=source_passed,
                 route_passed=route_passed,
                 latency_seconds=latency,
+                llm_calls=response.llm_calls,
+                llm_latency_seconds=response.llm_latency_seconds,
+                retrieval_latency_seconds=response.retrieval_latency_seconds,
+                generation_latency_seconds=response.generation_latency_seconds,
                 confidence=response.confidence,
                 sources=response.sources,
                 route_models=response.route.models,
@@ -112,15 +93,25 @@ def evaluate_golden(agent: ECUAgent, questions: Iterable[dict[str, str]]) -> dic
     latencies = [row.latency_seconds for row in rows]
     average_latency = sum(row.latency_seconds for row in rows) / total if total else 0.0
     average_confidence = sum(row.confidence for row in rows) / total if total else 0.0
+    average_score = sum(row.score for row in rows) / total if total else 0.0
+    average_llm_calls = sum(row.llm_calls for row in rows) / total if total else 0.0
+    average_llm_latency = sum(row.llm_latency_seconds for row in rows) / total if total else 0.0
+    average_retrieval_latency = sum(row.retrieval_latency_seconds for row in rows) / total if total else 0.0
+    average_generation_latency = sum(row.generation_latency_seconds for row in rows) / total if total else 0.0
     return {
         "total": total,
         "passed": passed_count,
         "accuracy": passed_count / total if total else 0.0,
+        "average_score": average_score,
         "source_match_rate": source_passed_count / total if total else 0.0,
         "route_match_rate": route_passed_count / total if total else 0.0,
         "average_latency_seconds": average_latency,
         "p95_latency_seconds": percentile(latencies, 95),
         "max_latency_seconds": max(latencies) if latencies else 0.0,
+        "average_llm_calls": average_llm_calls,
+        "average_llm_latency_seconds": average_llm_latency,
+        "average_retrieval_latency_seconds": average_retrieval_latency,
+        "average_generation_latency_seconds": average_generation_latency,
         "average_confidence": average_confidence,
         "low_confidence_count": low_confidence_count,
         "low_confidence_rate": low_confidence_count / total if total else 0.0,
@@ -150,26 +141,74 @@ def main(argv: list[str] | None = None) -> int:
     return 0
 
 
-def _contains_expected_hits(question_id: str, answer: str) -> bool:
-    expected = EXPECTED_HITS.get(question_id, ())
-    answer_lower = answer.lower()
-    return all(_contains_hit(answer_lower, hit) for hit in expected)
+def score_answer(expected_answer: str, answer: str) -> tuple[float, list[str]]:
+    keywords = extract_keywords(expected_answer)
+    if not keywords:
+        return 0.0, []
+    normalized_answer = normalize_text(answer)
+    matched = [keyword for keyword in keywords if keyword in normalized_answer]
+    return len(matched) / len(keywords), matched
 
 
-def _contains_hit(answer_lower: str, hit: str | tuple[str, ...]) -> bool:
-    if isinstance(hit, tuple):
-        return any(option.lower() in answer_lower for option in hit)
-    return hit.lower() in answer_lower
+def extract_keywords(expected_answer: str) -> list[str]:
+    normalized = normalize_text(expected_answer)
+    stopwords = {
+        "the", "a", "an", "is", "are", "was", "were", "to", "for", "of", "and",
+        "or", "in", "on", "with", "it", "this", "that", "has", "have", "features",
+        "capable", "capability", "capabilities", "while", "from", "as", "by", "be",
+        "up", "than", "per", "series", "model", "models", "makes", "suitable",
+    }
+    keywords = []
+    for token in normalized.split():
+        if token in stopwords:
+            continue
+        if len(token) <= 2 and not any(character.isdigit() for character in token):
+            continue
+        keywords.append(token)
+    return _dedupe(keywords)
 
 
-def _contains_expected_sources(question_id: str, sources: list[str]) -> bool:
-    expected = set(EXPECTED_SOURCES.get(question_id, ()))
-    return expected.issubset(set(sources))
+def normalize_text(value: str) -> str:
+    text = value.lower()
+    text = re.sub(r"[\u2010-\u2015\u2212]", "-", text)
+    text = re.sub(r"[^a-z0-9.+°@/_=-]+", " ", text)
+    text = re.sub(
+        r"(\d+(?:\.\d+)?)\s+(gb|kb|mb|mbps|tops|ghz|mhz|ma|a|v|°c|c)\b",
+        r"\1\2",
+        text,
+    )
+    text = re.sub(r"\s+", " ", text)
+    return text.strip()
 
 
-def _contains_expected_route_models(question_id: str, models: list[str]) -> bool:
-    expected = set(EXPECTED_ROUTE_MODELS.get(question_id, ()))
-    return expected.issubset(set(models))
+def expected_models_for_row(row: dict[str, str], agent: ECUAgent) -> list[str]:
+    text = f"{row.get('Question', '')} {row.get('Expected_Answer', '')}"
+    return models_in_query(text, catalog=agent.catalog, include_unknown=False)
+
+
+def expected_sources_match(expected_models: list[str], sources: list[str], agent: ECUAgent) -> bool:
+    if not expected_models:
+        return bool(sources)
+    expected_sources = {
+        entry.source
+        for entry in agent.catalog
+        if entry.model in set(expected_models)
+    }
+    return expected_sources.issubset(set(sources))
+
+
+def expected_route_match(expected_models: list[str], route_models: list[str]) -> bool:
+    if not expected_models:
+        return True
+    return set(expected_models).issubset(set(route_models))
+
+
+def _dedupe(values: list[str]) -> list[str]:
+    deduped = []
+    for value in values:
+        if value not in deduped:
+            deduped.append(value)
+    return deduped
 
 
 def percentile(values: list[float], percent: int) -> float:

@@ -9,11 +9,13 @@ from me_engineering_assistant.answering import AnswerDraft, generate_answer
 from me_engineering_assistant.config import bool_env
 from me_engineering_assistant.conversation import DEFAULT_SESSION_ID, ConversationManager
 from me_engineering_assistant.documents import (
+    default_document_paths,
     build_document_catalog,
     build_model_field_table,
     chunk_documents,
     load_source_documents,
 )
+from me_engineering_assistant.llm import get_llm_call_stats, reset_llm_call_stats
 from me_engineering_assistant.memory import GLOBAL_SCOPE, MemoryStore
 from me_engineering_assistant.observability import log_agent_response
 from me_engineering_assistant.planner import QueryPlan, models_from_catalog, plan_query
@@ -39,6 +41,7 @@ class GraphState(TypedDict, total=False):
     review_id: str | None
     review_reason: str | None
     trace: list[dict[str, Any]]
+    metrics: dict[str, float]
 
 
 @dataclass(frozen=True)
@@ -67,6 +70,11 @@ class AgentResponse:
     review_id: str | None = None
     review_reason: str | None = None
     trace: list[dict[str, Any]] | None = None
+    llm_calls: int = 0
+    llm_latency_seconds: float = 0.0
+    retrieval_latency_seconds: float = 0.0
+    generation_latency_seconds: float = 0.0
+    total_latency_seconds: float = 0.0
 
     def to_dict(self) -> dict[str, Any]:
         payload = {
@@ -77,22 +85,37 @@ class AgentResponse:
             "needs_review": self.needs_review,
             "review_id": self.review_id,
             "review_reason": self.review_reason,
+            "llm_calls": self.llm_calls,
+            "llm_latency_seconds": self.llm_latency_seconds,
+            "retrieval_latency_seconds": self.retrieval_latency_seconds,
+            "generation_latency_seconds": self.generation_latency_seconds,
+            "total_latency_seconds": self.total_latency_seconds,
         }
         if self.trace is not None:
             payload["trace"] = self.trace
         return payload
 
 
+@dataclass(frozen=True)
+class CorpusArtifacts:
+    documents: list[Any]
+    chunks: list[Any]
+    catalog: list[Any]
+    field_table: list[Any]
+
+
 def route_query(query: str) -> RouteDecision:
-    plan = plan_query(query, llm_enabled=False)
-    return _route_from_plan(plan)
+    corpus = _load_corpus(None)
+    catalog = corpus.catalog
+    plan = plan_query(query, llm_enabled=False, catalog=catalog)
+    return _route_from_plan(plan, catalog=catalog)
 
 
 def model_to_series(model: str, catalog=None) -> str:
     for entry in catalog or ():
         if entry.model == model:
             return entry.series
-    return "ECU-700" if model == "ECU-750" else "ECU-800"
+    return "unknown"
 
 
 class ECUAgent:
@@ -106,10 +129,11 @@ class ECUAgent:
         memory_scope: str = GLOBAL_SCOPE,
     ) -> None:
         self.docs_dir = Path(docs_dir).expanduser().resolve() if docs_dir else None
-        self.documents = load_source_documents(base_path=self.docs_dir)
-        self.chunks = chunk_documents(self.documents)
-        self.catalog = build_document_catalog(self.documents)
-        self.field_table = build_model_field_table(self.chunks)
+        corpus = _load_corpus(self.docs_dir)
+        self.documents = corpus.documents
+        self.chunks = corpus.chunks
+        self.catalog = corpus.catalog
+        self.field_table = corpus.field_table
         self.retriever = InMemoryECURetriever(self.chunks)
         self.toolbox = ECUToolbox(self.retriever, catalog=self.catalog, field_table=self.field_table)
         self.memory_enabled = bool_env("ME_MEMORY_ENABLED", default=False) if memory_enabled is None else memory_enabled
@@ -127,6 +151,7 @@ class ECUAgent:
         include_trace: bool = False,
         session_id: str | None = None,
     ) -> AgentResponse:
+        reset_llm_call_stats()
         started = time.perf_counter()
         initial_state: GraphState = {"query": query, "session_id": session_id or DEFAULT_SESSION_ID}
         if self._workflow is not None:
@@ -136,6 +161,9 @@ class ECUAgent:
 
         route = RouteDecision(**state["route"])
         trace = list(state.get("trace", []))
+        llm_stats = get_llm_call_stats()
+        metrics = state.get("metrics", {})
+        total_latency = time.perf_counter() - started
         response = AgentResponse(
             answer=state["answer"],
             sources=list(state["sources"]),
@@ -145,12 +173,17 @@ class ECUAgent:
             review_id=state.get("review_id"),
             review_reason=state.get("review_reason"),
             trace=trace if include_trace else None,
+            llm_calls=llm_stats.count,
+            llm_latency_seconds=llm_stats.latency_seconds,
+            retrieval_latency_seconds=float(metrics.get("retrieval_latency_seconds", 0.0)),
+            generation_latency_seconds=float(metrics.get("generation_latency_seconds", 0.0)),
+            total_latency_seconds=total_latency,
         )
         log_agent_response(
             query=query,
             response=response.to_dict(),
             trace=trace,
-            latency_seconds=time.perf_counter() - started,
+            latency_seconds=total_latency,
             retriever_backend=self.retriever.backend_name,
             docs_dir=str(self.docs_dir) if self.docs_dir else None,
         )
@@ -227,6 +260,7 @@ class ECUAgent:
             str(state.get("effective_query") or state["query"]),
             catalog=self.catalog,
             field_table=self.field_table,
+            tool_manifest=self.toolbox.manifest(),
         )
         route = _route_from_plan(query_plan, catalog=self.catalog)
         trace = list(state.get("trace", []))
@@ -243,7 +277,9 @@ class ECUAgent:
     def _retrieve_node(self, state: GraphState) -> GraphState:
         route = RouteDecision(**state["route"])
         query = str(state.get("effective_query") or state["query"])
+        started = time.perf_counter()
         results = self.retriever.retrieve(query, filters=route.filters(), top_k=6)
+        latency = time.perf_counter() - started
         retrieved = [result.to_dict() for result in results]
         trace = list(state.get("trace", []))
         trace.append(
@@ -253,12 +289,19 @@ class ECUAgent:
                 backend=self.retriever.backend_name,
                 sources=sorted({result.metadata.get("source", "unknown") for result in results}),
                 top_scores=[round(result.score, 4) for result in results[:3]],
+                latency_seconds=latency,
             )
         )
-        return {**state, "retrieved": retrieved, "trace": trace}
+        return {
+            **state,
+            "retrieved": retrieved,
+            "trace": trace,
+            "metrics": _merge_metrics(state, retrieval_latency_seconds=latency),
+        }
 
     def _generate_node(self, state: GraphState) -> GraphState:
         retrieved = [_result_from_dict(item) for item in state["retrieved"]]
+        started = time.perf_counter()
         draft = generate_answer(
             state["query"],
             self.toolbox,
@@ -266,9 +309,15 @@ class ECUAgent:
             route=state.get("route"),
             query_plan=QueryPlan(**state["query_plan"]) if state.get("query_plan") else None,
         )
+        latency = time.perf_counter() - started
         trace = list(state.get("trace", []))
         trace.extend(draft.trace or [])
-        return {**state, "draft": asdict(draft), "trace": trace}
+        return {
+            **state,
+            "draft": asdict(draft),
+            "trace": trace,
+            "metrics": _merge_metrics(state, generation_latency_seconds=latency),
+        }
 
     def _validate_node(self, state: GraphState) -> GraphState:
         draft = AnswerDraft(**state["draft"])
@@ -294,6 +343,11 @@ class ECUAgent:
                 needs_review=review.needs_review,
                 review_id=review.review_id,
                 review_reason=review.reason,
+                metrics={
+                    **state.get("metrics", {}),
+                    "llm_calls": get_llm_call_stats().count,
+                    "llm_latency_seconds": get_llm_call_stats().latency_seconds,
+                },
             )
         )
         return {
@@ -345,7 +399,7 @@ def _result_from_dict(item: Mapping[str, Any]) -> RetrievalResult:
 
 
 def _route_from_plan(plan: QueryPlan, catalog=None) -> RouteDecision:
-    series = sorted({model_to_series(model, catalog=catalog) for model in plan.entities})
+    series = sorted({value for model in plan.entities if (value := model_to_series(model, catalog=catalog)) != "unknown"})
     known_models = models_from_catalog(catalog)
     if not plan.entities:
         mode = "semantic"
@@ -354,3 +408,43 @@ def _route_from_plan(plan: QueryPlan, catalog=None) -> RouteDecision:
     else:
         mode = "metadata_filtered"
     return RouteDecision(mode=mode, models=plan.entities, series=series, reasons=plan.reasons)
+
+
+_CORPUS_CACHE: dict[tuple[tuple[str, int, int], ...], CorpusArtifacts] = {}
+
+
+def _load_corpus(docs_dir: str | Path | None) -> CorpusArtifacts:
+    key = _corpus_cache_key(docs_dir)
+    cached = _CORPUS_CACHE.get(key)
+    if cached is not None:
+        return cached
+
+    documents = load_source_documents(base_path=docs_dir)
+    chunks = chunk_documents(documents)
+    corpus = CorpusArtifacts(
+        documents=documents,
+        chunks=chunks,
+        catalog=build_document_catalog(documents),
+        field_table=build_model_field_table(chunks),
+    )
+    _CORPUS_CACHE[key] = corpus
+    return corpus
+
+
+def _corpus_cache_key(docs_dir: str | Path | None) -> tuple[tuple[str, int, int], ...]:
+    rows = []
+    for path in default_document_paths(docs_dir):
+        resolved = path.expanduser().resolve()
+        try:
+            stat = resolved.stat()
+        except OSError:
+            rows.append((str(resolved), 0, 0))
+            continue
+        rows.append((str(resolved), stat.st_mtime_ns, stat.st_size))
+    return tuple(rows)
+
+
+def _merge_metrics(state: Mapping[str, Any], **values: float) -> dict[str, float]:
+    metrics = {str(key): float(value) for key, value in (state.get("metrics") or {}).items()}
+    metrics.update({key: float(value) for key, value in values.items()})
+    return metrics

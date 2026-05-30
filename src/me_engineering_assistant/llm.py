@@ -1,20 +1,56 @@
 from __future__ import annotations
 
 import json
-import os
+import time
 import urllib.error
 import urllib.request
+from contextvars import ContextVar
+from dataclasses import asdict, dataclass
 from typing import Any, Mapping, Sequence
 
 from me_engineering_assistant.config import bool_env, env
 from me_engineering_assistant.retriever import RetrievalResult
 
 
+@dataclass(frozen=True)
+class LLMCallStats:
+    count: int = 0
+    latency_seconds: float = 0.0
+    failures: int = 0
+    providers: tuple[str, ...] = ()
+
+    def to_dict(self) -> dict[str, Any]:
+        payload = asdict(self)
+        payload["providers"] = list(self.providers)
+        return payload
+
+
+_LLM_CALL_STATS: ContextVar[LLMCallStats] = ContextVar("llm_call_stats", default=LLMCallStats())
+
+
+def reset_llm_call_stats() -> None:
+    _LLM_CALL_STATS.set(LLMCallStats())
+
+
+def get_llm_call_stats() -> LLMCallStats:
+    return _LLM_CALL_STATS.get()
+
+
 def generate_with_configured_llm(query: str, retrieved: Sequence[RetrievalResult]) -> str | None:
-    deepseek_answer = generate_with_deepseek_llm(query, retrieved)
-    if deepseek_answer:
-        return deepseek_answer
-    return generate_with_databricks_llm(query, retrieved)
+    messages = [
+        {
+            "role": "system",
+            "content": (
+                "You are an engineering assistant. Answer only from the supplied ECU "
+                "documentation context. Return concise technical answers with source-aware wording."
+            ),
+        },
+        {
+            "role": "user",
+            "content": f"Context:\n{_format_context(retrieved)}\n\nQuestion: {query}",
+        },
+    ]
+    return chat_with_configured_llm(messages, temperature=0.0)
 
 
 def chat_with_configured_llm(
@@ -22,9 +58,21 @@ def chat_with_configured_llm(
     *,
     temperature: float = 0.0,
 ) -> str | None:
-    deepseek_answer = chat_with_deepseek(messages, temperature=temperature)
-    if deepseek_answer:
-        return deepseek_answer
+    if env("DATABRICKS_LLM_ENDPOINT"):
+        databricks_answer = _record_llm_call(
+            "databricks",
+            lambda: chat_with_databricks(messages, temperature=temperature),
+        )
+        if databricks_answer:
+            return databricks_answer
+
+    if env("DEEPSEEK_API_KEY"):
+        deepseek_answer = _record_llm_call(
+            "deepseek",
+            lambda: chat_with_deepseek(messages, temperature=temperature),
+        )
+        if deepseek_answer:
+            return deepseek_answer
     return None
 
 
@@ -82,39 +130,41 @@ def chat_with_deepseek(
 
 
 def generate_with_deepseek_llm(query: str, retrieved: Sequence[RetrievalResult]) -> str | None:
-    messages = [
-        {
-            "role": "system",
-            "content": (
-                "You are an engineering assistant. Answer only from the supplied ECU "
-                "documentation context. Return concise technical answers with source-aware wording."
-            ),
-        },
-        {
-            "role": "user",
-            "content": f"Context:\n{_format_context(retrieved)}\n\nQuestion: {query}",
-        },
-    ]
-    return chat_with_deepseek(messages, temperature=0.0)
+    return generate_with_configured_llm(query, retrieved)
 
 
-def generate_with_databricks_llm(query: str, retrieved: Sequence[RetrievalResult]) -> str | None:
-    endpoint = os.getenv("DATABRICKS_LLM_ENDPOINT")
+def chat_with_databricks(
+    messages: Sequence[Mapping[str, str]],
+    *,
+    temperature: float = 0.0,
+) -> str | None:
+    endpoint = env("DATABRICKS_LLM_ENDPOINT")
     if not endpoint:
         return None
 
     try:
+        from langchain_core.messages import HumanMessage, SystemMessage
         from langchain_databricks import ChatDatabricks
     except ImportError:
         return None
 
-    prompt = (
-        "You are an engineering assistant. Answer only from the ECU documentation context. "
-        "If the answer is not present, say what is missing.\n\n"
-        f"Context:\n{_format_context(retrieved)}\n\nQuestion: {query}\nAnswer:"
-    )
-    response = ChatDatabricks(endpoint=endpoint, temperature=0).invoke(prompt)
+    langchain_messages = []
+    for message in messages:
+        content = str(message.get("content", ""))
+        if message.get("role") == "system":
+            langchain_messages.append(SystemMessage(content=content))
+        else:
+            langchain_messages.append(HumanMessage(content=content))
+
+    try:
+        response = ChatDatabricks(endpoint=endpoint, temperature=temperature).invoke(langchain_messages)
+    except Exception:  # pylint: disable=broad-exception-caught
+        return None
     return getattr(response, "content", str(response)).strip()
+
+
+def generate_with_databricks_llm(query: str, retrieved: Sequence[RetrievalResult]) -> str | None:
+    return generate_with_configured_llm(query, retrieved)
 
 
 def _format_context(retrieved: Sequence[RetrievalResult]) -> str:
@@ -134,3 +184,23 @@ def _extract_json(content: str) -> str:
     last_array = stripped.rfind("]")
     last = max(last_object, last_array)
     return stripped[first : last + 1] if last >= first else stripped
+
+
+def _record_llm_call(provider: str, call) -> str | None:
+    started = time.perf_counter()
+    success = False
+    try:
+        result = call()
+        success = bool(result)
+        return result
+    finally:
+        elapsed = time.perf_counter() - started
+        current = _LLM_CALL_STATS.get()
+        _LLM_CALL_STATS.set(
+            LLMCallStats(
+                count=current.count + 1,
+                latency_seconds=current.latency_seconds + elapsed,
+                failures=current.failures + (0 if success else 1),
+                providers=current.providers + (provider,),
+            )
+        )

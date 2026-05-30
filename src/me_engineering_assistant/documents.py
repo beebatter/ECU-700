@@ -105,33 +105,10 @@ def load_source_documents(
 
 
 def infer_metadata(path: Path, text: str) -> dict[str, str]:
-    filename = path.name.lower()
-    raw = f"{path.name}\n{text}".lower()
-    if "series_plus" in filename or "plus" in filename:
-        model = "ECU-850b"
-        series = "ECU-800"
-        doc_type = "variant"
-    elif "series_base" in filename or "base" in filename:
-        model = "ECU-850"
-        series = "ECU-800"
-        doc_type = "base"
-    elif "ecu-850b" in raw:
-        model = "ECU-850b"
-        series = "ECU-800"
-        doc_type = "variant"
-    elif "ecu-850" in raw:
-        model = "ECU-850"
-        series = "ECU-800"
-        doc_type = "base"
-    elif "ecu-750" in raw or "ecu-700" in raw:
-        model = "ECU-750"
-        series = "ECU-700"
-        doc_type = "legacy_manual"
-    else:
-        model = "unknown"
-        series = "unknown"
-        doc_type = "unknown"
-
+    raw = f"{path.name}\n{text}"
+    model = _infer_model_identifier(raw) or "unknown"
+    series = _series_for_model(model)
+    doc_type = _infer_doc_type(path, text)
     title = _first_heading(text) or path.stem
     return {
         "source": path.name,
@@ -141,6 +118,58 @@ def infer_metadata(path: Path, text: str) -> dict[str, str]:
         "series": series,
         "doc_type": doc_type,
     }
+
+
+def _infer_model_identifier(text: str) -> str | None:
+    identifiers = _ecu_identifiers(text)
+    model_identifiers = [identifier for identifier in identifiers if not _is_series_identifier(identifier)]
+    return model_identifiers[0] if model_identifiers else (identifiers[0] if identifiers else None)
+
+
+def _ecu_identifiers(text: str) -> list[str]:
+    identifiers = []
+    for match in re.findall(r"(?<![A-Za-z0-9])ecu[-_\s]?(\d{3}[a-z]?)(?![A-Za-z0-9])", text, flags=re.IGNORECASE):
+        identifier = _canonical_ecu_identifier(match)
+        if identifier not in identifiers:
+            identifiers.append(identifier)
+    return identifiers
+
+
+def _canonical_ecu_identifier(suffix: str) -> str:
+    suffix = suffix.upper()
+    if suffix.endswith("B"):
+        return f"ECU-{suffix[:-1]}b"
+    return f"ECU-{suffix}"
+
+
+def _is_series_identifier(identifier: str) -> bool:
+    match = re.fullmatch(r"ECU-(\d{3})([a-z]?)", identifier, flags=re.IGNORECASE)
+    return bool(match and not match.group(2) and match.group(1).endswith("00"))
+
+
+def _series_for_model(model: str) -> str:
+    match = re.fullmatch(r"ECU-(\d{3})([a-z]?)", model, flags=re.IGNORECASE)
+    if not match:
+        return "unknown"
+    series_number = f"{match.group(1)[0]}00"
+    return f"ECU-{series_number}"
+
+
+def _infer_doc_type(path: Path, text: str) -> str:
+    filename = path.name.lower()
+    if "plus" in filename or "addendum" in filename or "variant" in filename:
+        return "variant"
+    if "base" in filename or "baseline" in filename:
+        return "base"
+
+    raw = f"{path.name}\n{_first_heading(text) or ''}\n{text[:500]}".lower()
+    if "legacy" in raw or "manual" in raw:
+        return "legacy_manual"
+    if "base" in raw or "baseline" in raw:
+        return "base"
+    if "variant" in raw or "addendum" in raw or "enhanced" in raw or "plus" in raw:
+        return "variant"
+    return "spec"
 
 
 def chunk_documents(documents: Iterable[SourceDocument], max_chars: int = 1_100) -> list[DocumentChunk]:
@@ -179,8 +208,9 @@ def build_document_catalog(documents: Iterable[SourceDocument]) -> list[CatalogE
 
 
 def build_model_field_table(chunks: Iterable[DocumentChunk]) -> list[ModelFieldEvidence]:
+    chunk_list = list(chunks)
     rows = []
-    for chunk in chunks:
+    for chunk in chunk_list:
         metadata = chunk.metadata
         if metadata.get("chunk_type") != "field" or not metadata.get("field"):
             continue
@@ -196,7 +226,59 @@ def build_model_field_table(chunks: Iterable[DocumentChunk]) -> list[ModelFieldE
                 chunk_id=chunk.chunk_id,
             )
         )
+    rows.extend(_inherited_variant_rows(rows, chunk_list))
     return rows
+
+
+def _inherited_variant_rows(
+    rows: Sequence[ModelFieldEvidence],
+    chunks: Sequence[DocumentChunk],
+) -> list[ModelFieldEvidence]:
+    inherited = []
+    base_by_series = {
+        chunk.metadata.get("series"): chunk.metadata.get("model")
+        for chunk in chunks
+        if chunk.metadata.get("doc_type") == "base"
+    }
+    inheriting_variants = _variant_inheritance_sources(chunks)
+    fields_by_model = {}
+    for row in rows:
+        fields_by_model.setdefault(row.model, set()).add(row.field)
+
+    for variant_model, variant_metadata in inheriting_variants.items():
+        base_model = base_by_series.get(variant_metadata.get("series"))
+        if not base_model:
+            continue
+        variant_fields = fields_by_model.setdefault(variant_model, set())
+        for base_row in rows:
+            if base_row.model != base_model or base_row.field in variant_fields:
+                continue
+            inherited.append(
+                ModelFieldEvidence(
+                    model=variant_model,
+                    series=variant_metadata.get("series", base_row.series),
+                    field=base_row.field,
+                    field_label=base_row.field_label,
+                    value=f"Inherited from base {base_model}: {base_row.value}",
+                    source=variant_metadata.get("source", base_row.source),
+                    section="Inherited base features",
+                    chunk_id=f"{variant_model}::inherited::{base_row.chunk_id}",
+                )
+            )
+            variant_fields.add(base_row.field)
+    return inherited
+
+
+def _variant_inheritance_sources(chunks: Sequence[DocumentChunk]) -> dict[str, dict[str, str]]:
+    variants = {}
+    for chunk in chunks:
+        metadata = chunk.metadata
+        if metadata.get("doc_type") != "variant":
+            continue
+        if not re.search(r"\bincludes\s+all\s+features\s+of\s+(?:the\s+)?base\b", chunk.content, re.IGNORECASE):
+            continue
+        variants[metadata.get("model", "")] = metadata
+    return {model: metadata for model, metadata in variants.items() if model}
 
 
 def _first_heading(text: str) -> str | None:

@@ -68,6 +68,10 @@ def build_agent_log_record(
         "review_id": response.get("review_id"),
         "review_reason": response.get("review_reason"),
         "latency_seconds": latency_seconds,
+        "llm_calls": response.get("llm_calls", 0),
+        "llm_latency_seconds": response.get("llm_latency_seconds", 0.0),
+        "retrieval_latency_seconds": response.get("retrieval_latency_seconds", 0.0),
+        "generation_latency_seconds": response.get("generation_latency_seconds", 0.0),
         "retriever_backend": retriever_backend,
         "docs_dir": docs_dir,
     }
@@ -108,6 +112,8 @@ def load_log_records(path: str | Path | None = None) -> list[dict[str, Any]]:
 def summarize_log_records(records: Iterable[Mapping[str, Any]]) -> dict[str, Any]:
     rows = [record for record in records if record.get("event_type") == "agent_response"]
     latencies = [_float(record.get("latency_seconds"), 0.0) for record in rows]
+    llm_latencies = [_float(record.get("llm_latency_seconds"), 0.0) for record in rows]
+    llm_calls = [_float(record.get("llm_calls"), 0.0) for record in rows]
     detectors = [record.get("detectors") or detect_log_record(record) for record in rows]
     return {
         "total": len(rows),
@@ -117,6 +123,8 @@ def summarize_log_records(records: Iterable[Mapping[str, Any]]) -> dict[str, Any
         "slow_response_count": sum(1 for item in detectors if item.get("slow_response")),
         "average_latency_seconds": mean(latencies) if latencies else 0.0,
         "max_latency_seconds": max(latencies) if latencies else 0.0,
+        "average_llm_latency_seconds": mean(llm_latencies) if llm_latencies else 0.0,
+        "average_llm_calls": mean(llm_calls) if llm_calls else 0.0,
     }
 
 

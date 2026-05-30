@@ -54,6 +54,23 @@ class AnsweringTests(unittest.TestCase):
         self.assertIn("ECU-850b", response.answer)
         self.assertIn("5 TOPS", response.answer)
 
+    def test_grounding_accepts_numeric_unit_spacing_variants(self) -> None:
+        evidence = [
+            answering.RetrievalResult(
+                content="Power Consumption: Idle: 550mA, Under Load: 1.7A",
+                metadata={"source": "ECU-800_Series_Plus.md"},
+                score=1.0,
+            )
+        ]
+
+        unsupported = answering.unsupported_numeric_or_command_claims(
+            "The ECU-850b uses 1.7 A under load.",
+            tool_results=[],
+            evidence=evidence,
+        )
+
+        self.assertEqual(unsupported, [])
+
     def test_llm_tool_plan_is_sanitized_before_execution(self) -> None:
         plan = answering.AgentPlan(
             rationale="LLM supplied extra arguments.",

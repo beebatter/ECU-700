@@ -2,19 +2,12 @@ from __future__ import annotations
 
 import json
 import re
-from dataclasses import asdict, dataclass
+from dataclasses import asdict, dataclass, field
 from typing import Any, Mapping, Sequence
 
 from me_engineering_assistant.config import bool_env, env
 from me_engineering_assistant.documents import CatalogEntry, ModelFieldEvidence
 from me_engineering_assistant.llm import json_with_configured_llm
-
-
-ALL_MODELS = ("ECU-750", "ECU-850", "ECU-850b")
-DEFAULT_SERIES_TO_MODELS = {
-    "ECU-700": ("ECU-750",),
-    "ECU-800": ("ECU-850", "ECU-850b"),
-}
 
 
 @dataclass(frozen=True)
@@ -26,6 +19,8 @@ class QueryPlan:
     route: str
     subqueries: list[dict[str, str]]
     reasons: list[str]
+    tool_calls: list[dict[str, Any]] = field(default_factory=list)
+    requires_coverage: bool = False
 
     def to_dict(self) -> dict[str, Any]:
         return asdict(self)
@@ -37,6 +32,7 @@ def plan_query(
     llm_enabled: bool | None = None,
     catalog: Sequence[CatalogEntry] | None = None,
     field_table: Sequence[ModelFieldEvidence] | None = None,
+    tool_manifest: Sequence[Mapping[str, Any]] | None = None,
 ) -> QueryPlan:
     """
     Build a retrieval plan without hard-coded user-intent branches.
@@ -49,14 +45,27 @@ def plan_query(
     """
 
     base_plan = semantic_fallback_plan(query, catalog=catalog)
-    use_llm = bool_env("ME_USE_LLM_PLANNER", default=bool(env("DEEPSEEK_API_KEY"))) if llm_enabled is None else llm_enabled
+    llm_configured = bool(env("DATABRICKS_LLM_ENDPOINT") or env("DEEPSEEK_API_KEY"))
+    use_llm = bool_env("ME_USE_LLM_PLANNER", default=llm_configured) if llm_enabled is None else llm_enabled
     if not use_llm:
         return base_plan
 
-    llm_plan = plan_with_llm(query=query, base_plan=base_plan, catalog=catalog, field_table=field_table)
+    llm_plan = plan_with_llm(
+        query=query,
+        base_plan=base_plan,
+        catalog=catalog,
+        field_table=field_table,
+        tool_manifest=tool_manifest,
+    )
     if llm_plan is None:
         return base_plan
-    return sanitize_query_plan(llm_plan, query=query, catalog=catalog, field_table=field_table)
+    return sanitize_query_plan(
+        llm_plan,
+        query=query,
+        catalog=catalog,
+        field_table=field_table,
+        tool_manifest=tool_manifest,
+    )
 
 
 def semantic_fallback_plan(
@@ -88,18 +97,21 @@ def plan_with_llm(
     base_plan: QueryPlan,
     catalog: Sequence[CatalogEntry] | None = None,
     field_table: Sequence[ModelFieldEvidence] | None = None,
+    tool_manifest: Sequence[Mapping[str, Any]] | None = None,
 ) -> QueryPlan | None:
     payload = json_with_configured_llm(
         [
             {
                 "role": "system",
                 "content": (
-                    "You create retrieval plans for an ECU documentation RAG agent. "
+                    "You create a single retrieval and tool-use plan for an ECU documentation RAG agent. "
                     "Return strict JSON only. Do not answer the user. Do not invent "
                     "facts. Use only the provided document catalog and field catalog. "
-                    "The plan is for retrieval, not final reasoning. Keep task_type, "
-                    "scope, and route as short descriptive labels rather than forcing "
-                    "the question into predefined categories."
+                    "The plan is for retrieval, not final reasoning. Include tool_calls "
+                    "that gather enough evidence for the final answer. Set requires_coverage "
+                    "true only when one normalized field must be verified for every requested "
+                    "model. Keep task_type, scope, and route as short descriptive labels "
+                    "rather than forcing the question into predefined categories."
                 ),
             },
             {
@@ -109,6 +121,7 @@ def plan_with_llm(
                         "query": query,
                         "document_catalog": [entry.to_dict() for entry in catalog or ()],
                         "field_catalog": field_catalog(field_table),
+                        "available_tools": list(tool_manifest or ()),
                         "base_plan": base_plan.to_dict(),
                         "required_json_shape": {
                             "task_type": "short descriptive label",
@@ -124,6 +137,13 @@ def plan_with_llm(
                                 }
                             ],
                             "reasons": ["brief evidence-planning reason"],
+                            "tool_calls": [
+                                {
+                                    "name": "one available tool name",
+                                    "arguments": {"query": "specific retrieval query"},
+                                }
+                            ],
+                            "requires_coverage": False,
                         },
                     },
                     ensure_ascii=False,
@@ -147,6 +167,12 @@ def plan_with_llm(
         ]
         or base_plan.subqueries,
         reasons=[str(item) for item in payload.get("reasons") or base_plan.reasons],
+        tool_calls=[
+            {"name": str(item.get("name")), "arguments": dict(item.get("arguments") or {})}
+            for item in payload.get("tool_calls", [])
+            if isinstance(item, dict)
+        ],
+        requires_coverage=bool(payload.get("requires_coverage", False)),
     )
 
 
@@ -156,6 +182,7 @@ def sanitize_query_plan(
     query: str = "",
     catalog: Sequence[CatalogEntry] | None = None,
     field_table: Sequence[ModelFieldEvidence] | None = None,
+    tool_manifest: Sequence[Mapping[str, Any]] | None = None,
 ) -> QueryPlan:
     known_models = models_from_catalog(catalog)
     known_fields = fields_from_table(field_table)
@@ -181,7 +208,89 @@ def sanitize_query_plan(
         route=_sanitize_label(plan.route) or "standard",
         subqueries=subqueries,
         reasons=list(plan.reasons or ["sanitized_plan"]),
+        tool_calls=sanitize_tool_calls(
+            plan.tool_calls,
+            tool_manifest=tool_manifest,
+            fallback_query=query,
+            entities=entities,
+            attribute=attribute,
+        ),
+        requires_coverage=bool(plan.requires_coverage and entities and attribute),
     )
+
+
+def sanitize_tool_calls(
+    tool_calls: Sequence[Mapping[str, Any]],
+    *,
+    tool_manifest: Sequence[Mapping[str, Any]] | None = None,
+    fallback_query: str,
+    entities: Sequence[str],
+    attribute: str | None,
+) -> list[dict[str, Any]]:
+    manifest = {str(tool.get("name")): tool for tool in tool_manifest or ()}
+    sanitized = []
+    for call in tool_calls:
+        name = str(call.get("name") or "")
+        if manifest and name not in manifest:
+            continue
+        arguments = dict(call.get("arguments") or {})
+        if manifest:
+            allowed = set((manifest[name].get("input_schema") or {}).get("properties") or {})
+            arguments = {key: value for key, value in arguments.items() if key in allowed}
+        arguments = _sanitize_tool_arguments(
+            name=name,
+            arguments=arguments,
+            fallback_query=fallback_query,
+            entities=entities,
+            attribute=attribute,
+        )
+        if arguments is None:
+            continue
+        sanitized.append({"name": name, "arguments": arguments})
+    return sanitized
+
+
+def _sanitize_tool_arguments(
+    *,
+    name: str,
+    arguments: Mapping[str, Any],
+    fallback_query: str,
+    entities: Sequence[str],
+    attribute: str | None,
+) -> dict[str, Any] | None:
+    if name == "search_documents":
+        sanitized: dict[str, Any] = {"query": str(arguments.get("query") or fallback_query)}
+        for key in ("models", "series", "fields", "sources"):
+            values = _as_string_list(arguments.get(key))
+            if key == "models" and entities:
+                values = [value for value in values if value in entities]
+            if values:
+                sanitized[key] = values
+        if entities and not sanitized.get("models"):
+            sanitized["models"] = list(entities)
+        if arguments.get("field"):
+            sanitized["field"] = str(arguments["field"])
+        elif attribute:
+            sanitized["field"] = attribute
+        sanitized["top_k"] = _clamp_top_k(arguments.get("top_k"), default=10)
+        return sanitized
+
+    if name in {"get_model_field_evidence", "check_evidence_coverage"}:
+        models = _as_string_list(arguments.get("models")) or list(entities)
+        if entities:
+            models = [model for model in models if model in entities]
+        field_value = str(arguments.get("field") or attribute or "")
+        if name == "check_evidence_coverage" and (not models or not field_value):
+            return None
+        sanitized = {"models": models}
+        if field_value:
+            sanitized["field"] = field_value
+        return sanitized
+
+    if name in {"list_sources", "get_document_catalog"}:
+        return {}
+
+    return dict(arguments)
 
 
 def build_subqueries(query: str, entities: Sequence[str], attribute: str | None) -> list[dict[str, str]]:
@@ -226,15 +335,12 @@ def models_in_query(
 
 def models_from_catalog(catalog: Sequence[CatalogEntry] | None) -> list[str]:
     models = [entry.model for entry in catalog or () if entry.model and entry.model != "unknown"]
-    return _dedupe(models) or list(ALL_MODELS)
+    return _dedupe(models)
 
 
 def series_models_from_catalog(catalog: Sequence[CatalogEntry] | None) -> dict[str, list[str]]:
-    if not catalog:
-        return {series: list(models) for series, models in DEFAULT_SERIES_TO_MODELS.items()}
-
     by_series: dict[str, list[str]] = {}
-    for entry in catalog:
+    for entry in catalog or ():
         if not entry.series or entry.series == "unknown" or not entry.model or entry.model == "unknown":
             continue
         by_series.setdefault(entry.series, [])
@@ -278,9 +384,9 @@ def _sanitize_attribute(attribute: str | None, *, known_fields: Sequence[str]) -
     if not known_fields:
         return cleaned
 
-    for field in known_fields:
-        if cleaned == field or _token_overlap(cleaned, field):
-            return field
+    for field_name in known_fields:
+        if cleaned == field_name or _token_overlap(cleaned, field_name):
+            return field_name
     return cleaned
 
 
@@ -317,3 +423,21 @@ def _dedupe(values: Sequence[str]) -> list[str]:
         if value not in deduped:
             deduped.append(value)
     return deduped
+
+
+def _as_string_list(value: Any) -> list[str]:
+    if value is None:
+        return []
+    if isinstance(value, str):
+        return [value]
+    if isinstance(value, Sequence) and not isinstance(value, (bytes, bytearray)):
+        return [str(item) for item in value if item]
+    return [str(value)]
+
+
+def _clamp_top_k(value: Any, default: int) -> int:
+    try:
+        top_k = int(value)
+    except (TypeError, ValueError):
+        top_k = default
+    return max(1, min(10, top_k))

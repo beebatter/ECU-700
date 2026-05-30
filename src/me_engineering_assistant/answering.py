@@ -7,7 +7,7 @@ from typing import Any, Mapping, Sequence
 
 from me_engineering_assistant.config import bool_env, env
 from me_engineering_assistant.coverage import CoverageReport, check_plan_coverage
-from me_engineering_assistant.llm import chat_with_configured_llm, json_with_configured_llm
+from me_engineering_assistant.llm import chat_with_configured_llm
 from me_engineering_assistant.planner import QueryPlan, models_in_query
 from me_engineering_assistant.retriever import RetrievalResult
 from me_engineering_assistant.tools import ECUToolbox, ToolCall, ToolResult, retrieval_results_from_tool
@@ -59,32 +59,29 @@ def generate_answer(
     )
 
     evidence = evidence_from_tool_results(tool_results) or list(retrieved)
-    coverage_report = check_plan_coverage(query_plan, evidence) if query_plan else None
+    run_coverage = should_run_coverage_check(query_plan=query_plan, tool_results=tool_results)
+    coverage_report = check_plan_coverage(query_plan, evidence) if run_coverage and query_plan else None
     corrective_results = []
-    if coverage_report and not coverage_report.complete:
+    if coverage_report and not coverage_report.complete and should_run_corrective_retrieval(query_plan, tool_results):
         corrective_results = corrective_retrieval(toolbox=toolbox, query_plan=query_plan, missing=coverage_report.missing)
         tool_results.extend(corrective_results)
         evidence = evidence_from_tool_results(tool_results) or list(retrieved)
         coverage_report = check_plan_coverage(query_plan, evidence)
-    if coverage_report:
-        trace.append(
-            trace_step(
-                "coverage_check",
-                summary=(
-                    "Coverage complete."
-                    if coverage_report.complete
-                    else f"Coverage incomplete for {len(coverage_report.missing)} entity-field pair(s)."
-                ),
-                coverage=coverage_report.to_dict(),
-                corrective_calls=len(corrective_results),
-            )
+    trace.append(
+        trace_step(
+            "coverage_check",
+            summary=coverage_summary(coverage_report, run_coverage=run_coverage),
+            coverage=coverage_report.to_dict() if coverage_report else None,
+            corrective_calls=len(corrective_results),
         )
+    )
 
     evidence = coverage_approved_evidence(evidence, coverage_report)
     evidence_sources = _sources_from_evidence(evidence)
     answer = None
     synthesis_mode = "extractive_rag"
-    if bool_env("ME_USE_LLM_ANSWER", default=bool(env("DEEPSEEK_API_KEY"))) or bool_env("ME_FORCE_LLM", default=False):
+    llm_configured = bool(env("DATABRICKS_LLM_ENDPOINT") or env("DEEPSEEK_API_KEY"))
+    if bool_env("ME_USE_LLM_ANSWER", default=llm_configured) or bool_env("ME_FORCE_LLM", default=False):
         answer = compose_with_llm(query=query, plan=plan, evidence=evidence, coverage_report=coverage_report)
         synthesis_mode = "llm_grounded" if answer else "extractive_after_llm_fallback"
     if not answer:
@@ -131,17 +128,20 @@ def plan_tool_calls(
     route: Mapping[str, Any] | None = None,
     query_plan: QueryPlan | None = None,
 ) -> AgentPlan:
-    use_llm_planner = bool_env("ME_USE_LLM_PLANNER", default=bool(env("DEEPSEEK_API_KEY")))
-    use_llm_tool_planner = use_llm_planner and bool_env("ME_USE_LLM_TOOL_PLANNER", default=True)
-    if use_llm_tool_planner:
-        llm_plan = plan_with_llm(query=query, toolbox=toolbox, route=route)
-        if llm_plan is not None:
-            sanitized = sanitize_plan(query=query, route=route, toolbox=toolbox, plan=llm_plan)
-            if sanitized.calls:
-                return ensure_search_call(query=query, route=route, query_plan=query_plan, plan=sanitized)
+    if query_plan and query_plan.tool_calls:
+        plan = AgentPlan(
+            rationale="Unified LLM retrieval plan selected evidence tools.",
+            calls=[
+                ToolCall(name=str(item.get("name")), arguments=dict(item.get("arguments") or {}))
+                for item in query_plan.tool_calls
+            ],
+        )
+        sanitized = sanitize_plan(query=query, route=route, toolbox=toolbox, plan=plan)
+        if sanitized.calls:
+            return ensure_search_call(query=query, route=route, query_plan=query_plan, plan=sanitized)
 
     calls: list[ToolCall] = []
-    if query_plan and query_plan.entities and query_plan.attribute:
+    if query_plan and query_plan.entities and query_plan.attribute and query_plan.requires_coverage:
         calls.extend(
             [
                 ToolCall("get_model_field_evidence", {"models": query_plan.entities, "field": query_plan.attribute}),
@@ -151,46 +151,6 @@ def plan_tool_calls(
     calls.append(_search_call(query, route, query_plan=query_plan))
     plan = AgentPlan(rationale="RAG controller selected evidence retrieval tools.", calls=calls)
     return sanitize_plan(query=query, route=route, toolbox=toolbox, plan=plan)
-
-
-def plan_with_llm(
-    *,
-    query: str,
-    toolbox: ECUToolbox,
-    route: Mapping[str, Any] | None = None,
-) -> AgentPlan | None:
-    messages = [
-        {
-            "role": "system",
-            "content": (
-                "You are a ReAct/Plan-Execute controller for an ECU engineering RAG agent. "
-                "Choose retrieval tool calls that gather evidence from internal markdown documents. "
-                "Do not answer directly. Return strict JSON only with keys rationale and tool_calls. "
-                "Each tool call must have name and arguments. Available tools:\n"
-                f"{json.dumps(toolbox.manifest(), indent=2)}"
-            ),
-        },
-        {
-            "role": "user",
-            "content": json.dumps({"query": query, "router_hint": route or {}}, ensure_ascii=False),
-        },
-    ]
-    payload = json_with_configured_llm(messages)
-    if not isinstance(payload, dict):
-        return None
-    calls = []
-    for item in payload.get("tool_calls", []):
-        if not isinstance(item, dict):
-            continue
-        calls.append(ToolCall(name=str(item.get("name")), arguments=dict(item.get("arguments") or {})))
-    return AgentPlan(rationale=str(payload.get("rationale") or "LLM planned retrieval calls."), calls=calls)
-
-
-def complete_plan(query: str, route: Mapping[str, Any] | None, plan: AgentPlan) -> AgentPlan:
-    calls = list(plan.calls)
-    if not any(call.name == "search_documents" for call in calls):
-        calls.insert(0, _search_call(query, route))
-    return AgentPlan(rationale=f"{plan.rationale} Plan normalized to the RAG retrieval contract.", calls=calls)
 
 
 def ensure_search_call(
@@ -224,6 +184,10 @@ def sanitize_plan(
             arguments = _sanitize_search_arguments(query=query, route=route, arguments=arguments)
         elif call.name == "list_sources":
             arguments = {}
+        elif call.name in {"get_model_field_evidence", "check_evidence_coverage"}:
+            arguments = _sanitize_model_field_arguments(route=route, arguments=arguments)
+            if call.name == "check_evidence_coverage" and (not arguments.get("models") or not arguments.get("field")):
+                continue
         sanitized.append(ToolCall(name=call.name, arguments=arguments))
     return AgentPlan(rationale=plan.rationale, calls=sanitized)
 
@@ -248,6 +212,19 @@ def _sanitize_search_arguments(
     return sanitized
 
 
+def _sanitize_model_field_arguments(
+    *,
+    route: Mapping[str, Any] | None,
+    arguments: Mapping[str, Any],
+) -> dict[str, Any]:
+    route_models = list((route or {}).get("models") or ())
+    models = _as_string_list(arguments.get("models")) or route_models
+    sanitized: dict[str, Any] = {"models": models}
+    if arguments.get("field"):
+        sanitized["field"] = str(arguments["field"])
+    return sanitized
+
+
 def execute_plan(toolbox: ECUToolbox, plan: AgentPlan) -> list[ToolResult]:
     results: list[ToolResult] = []
     allowed = {tool["name"] for tool in toolbox.manifest()}
@@ -256,6 +233,38 @@ def execute_plan(toolbox: ECUToolbox, plan: AgentPlan) -> list[ToolResult]:
             continue
         results.append(toolbox.execute(call))
     return results
+
+
+def should_run_coverage_check(
+    *,
+    query_plan: QueryPlan | None,
+    tool_results: Sequence[ToolResult],
+) -> bool:
+    if not query_plan or not query_plan.entities or not query_plan.attribute:
+        return False
+    return bool(
+        query_plan.requires_coverage
+        or any(result.name == "check_evidence_coverage" for result in tool_results)
+    )
+
+
+def should_run_corrective_retrieval(query_plan: QueryPlan | None, tool_results: Sequence[ToolResult]) -> bool:
+    if not query_plan:
+        return False
+    return bool(
+        query_plan.requires_coverage
+        or any(result.name == "check_evidence_coverage" for result in tool_results)
+    )
+
+
+def coverage_summary(coverage_report: CoverageReport | None, *, run_coverage: bool) -> str:
+    if not run_coverage:
+        return "Coverage check skipped; LLM plan did not request model-field coverage."
+    if coverage_report is None:
+        return "Coverage check skipped; no model-field plan was available."
+    if coverage_report.complete:
+        return "Coverage complete."
+    return f"Coverage incomplete for {len(coverage_report.missing)} entity-field pair(s)."
 
 
 def plan_to_dict(plan: AgentPlan) -> dict[str, Any]:
@@ -293,7 +302,10 @@ def compose_with_llm(
                 "You are an ECU engineering assistant using standard RAG. Answer only from the "
                 "provided retrieved markdown evidence. Do not use outside knowledge. If the evidence "
                 "does not support the user's criterion, say the documentation does not contain enough "
-                "information. Include concise source filenames in the answer."
+                "information. Preserve exact model identifiers, units, command strings, and important "
+                "descriptors from the evidence. When a value contains multiple operating states or a "
+                "range, include the related states or endpoints. Include concise source filenames in "
+                "the answer."
             ),
         },
         {
@@ -593,10 +605,16 @@ def coverage_approved_evidence(
     if not coverage_report or not coverage_report.items:
         return list(evidence)
     approved = []
+    covered_models = {item.entity for item in coverage_report.items}
     for item in coverage_report.items:
         for result in evidence:
             if result.metadata.get("model") == item.entity and result.metadata.get("field"):
                 approved.append(result)
+    approved.extend(
+        result
+        for result in evidence
+        if result.metadata.get("chunk_type") == "section" and result.metadata.get("model") in covered_models
+    )
     return _dedupe_evidence(approved)
 
 
@@ -669,12 +687,23 @@ def unsupported_numeric_or_command_claims(
         )
     )
     unsupported = []
-    normalized_evidence = evidence_text.replace("°", "")
+    normalized_evidence = _normalize_grounding_text(evidence_text)
     for claim in claims:
         compact = claim.strip().rstrip(".,;")
-        if compact and compact.replace("°", "") not in normalized_evidence:
+        if compact and _normalize_grounding_text(compact) not in normalized_evidence:
             unsupported.append(compact)
     return _dedupe(unsupported)
+
+
+def _normalize_grounding_text(value: str) -> str:
+    normalized = value.lower().replace("°", "")
+    normalized = re.sub(r"[\u2010-\u2015\u2212]", "-", normalized)
+    normalized = re.sub(
+        r"(\d+(?:\.\d+)?)\s+(gb|kb|mb|mbps|tops|ghz|mhz|ma|a|v|c)\b",
+        r"\1\2",
+        normalized,
+    )
+    return normalized
 
 
 def _dedupe(values: Sequence[str]) -> list[str]:

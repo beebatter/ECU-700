@@ -4,13 +4,14 @@ This project implements the ECU engineering coding challenge as a small Python
 package instead of a notebook. It provides a LangGraph-style RAG agent that can
 route questions across the ECU-700 and ECU-800 Markdown specifications, return
 answers with sources, validate against the supplied golden questions, and run
-locally with optional DeepSeek LLM generation and local hybrid retrieval.
+locally with Databricks-first or DeepSeek-compatible LLM generation plus local
+hybrid retrieval.
 
 ## Architecture
 
 The runtime flow is hybrid RAG with optional application-layer memory:
 
-`User query -> load_memory -> query_plan -> hybrid retrieve -> coverage check -> corrective retrieval -> grounded synthesis -> validate -> reflect_memory -> answer`
+`User query -> load_memory -> unified LLM query/tool plan -> hybrid retrieve -> optional coverage check -> grounded synthesis -> validate -> reflect_memory -> answer`
 
 - `documents.py` loads the three Markdown documents and chunks by headings and
   paragraphs, then creates field-level chunks from table/spec rows. Field
@@ -20,13 +21,13 @@ The runtime flow is hybrid RAG with optional application-layer memory:
   normalized embeddings, FAISS performs dense similarity search, `rank-bm25`
   provides sparse keyword scoring, and a local reranker combines dense, sparse,
   metadata, and field matches.
-- `planner.py` produces a structured retrieval plan without hard-coded intent
-  categories. With an LLM enabled, the model proposes entities, optional fields,
-  and subqueries from the document catalog. Without an LLM, the fallback only
-  links explicit ECU model/series mentions to metadata and leaves the query broad
-  for retrieval.
-- `coverage.py` checks whether each requested model-field pair has grounded
-  evidence and triggers corrective retrieval before answer generation.
+- `planner.py` produces a structured retrieval and tool-use plan without
+  hard-coded intent categories. With an LLM enabled, one planning call proposes
+  entities, optional fields, subqueries, tool calls, and whether model-field
+  coverage is required. Without an LLM, the fallback only links explicit ECU
+  model/series mentions to metadata and leaves the query broad for retrieval.
+- `coverage.py` checks requested model-field pairs only when the LLM plan asks
+  for coverage, then can trigger corrective retrieval before answer generation.
 - `graph.py` builds the LangGraph workflow when `langgraph` is installed. The
   same node functions run locally without LangGraph so the package remains
   testable in lightweight environments.
@@ -47,17 +48,18 @@ The runtime flow is hybrid RAG with optional application-layer memory:
 - `mcp_server.py` runs a real Model Context Protocol server using the official
   Python SDK. MCP clients can discover and call the same ECU tools over stdio or
   Streamable HTTP.
-- `llm.py` can use `DEEPSEEK_API_KEY` for planning and/or final synthesis, but
-  final answers are constrained to tool evidence and source filenames.
+- `llm.py` uses `DATABRICKS_LLM_ENDPOINT` first and falls back to
+  `DEEPSEEK_API_KEY` for local development. Final answers are constrained to
+  tool evidence and source filenames.
 - `model.py` wraps the agent as an `mlflow.pyfunc.PythonModel` with a `predict`
   method that accepts strings, dictionaries, lists, or dataframe-like inputs.
   Requests may include `session_id` when memory is enabled.
 
 The anti-hallucination guardrails are intentionally simple and inspectable:
 
-- the LLM planner may only create a structured retrieval plan, not final facts;
+- the LLM planner may only create a structured retrieval/tool plan, not final facts;
 - the final answer is generated from returned tool evidence;
-- entity-field coverage is checked before high-confidence comparative answers;
+- entity-field coverage is checked when the LLM plan explicitly requests it;
 - answers include source filenames from the internal documentation;
 - numeric values and commands are checked against tool evidence;
 - unsupported criteria are handled by grounded LLM synthesis when enabled, and
@@ -131,8 +133,9 @@ DeepSeek is used for chat/completion calls here. Embeddings and sparse retrieval
 are local via `sentence-transformers` + FAISS + BM25 because this project does
 not rely on a DeepSeek embedding model.
 
-DeepSeek is the default LLM path when `DEEPSEEK_API_KEY` is set. The sample
-configuration enables LLM query planning, LLM tool planning, and grounded LLM
+Databricks is the preferred LLM path when `DATABRICKS_LLM_ENDPOINT` is set.
+DeepSeek is the local development fallback when `DEEPSEEK_API_KEY` is set. The
+sample configuration enables unified LLM query/tool planning and grounded LLM
 answer synthesis:
 
 ```bash
@@ -143,9 +146,9 @@ PYTHONPATH=src python3 -m me_engineering_assistant \
 
 For deterministic offline tests, set those flags to `false`; the same RAG
 retrieval tool is still used through the local fallback planner, but no
-question-type or field-keyword classifier is used. `ME_USE_LLM_TOOL_PLANNER`
-is gated by `ME_USE_LLM_PLANNER`, so disabling planner also disables LLM tool
-planning.
+question-type or field-keyword classifier is used. `ME_USE_LLM_TOOL_PLANNER` is
+kept for backward-compatible configuration but the current runtime uses one
+unified planning call rather than a second tool-planning LLM call.
 
 To inspect the agent process, enable trace output:
 
@@ -291,7 +294,8 @@ validation checks:
 - feature availability, including OTA support and negative confirmation;
 - exact command retrieval for the ECU-850b NPU enablement command;
 - answer accuracy, source match rate, route match rate, confidence, review rate,
-  and response latency metrics.
+  total latency, LLM call count, LLM latency, retrieval latency, and generation
+  latency metrics.
 
 Run the local evaluation framework:
 

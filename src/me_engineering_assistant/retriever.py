@@ -10,6 +10,7 @@ from me_engineering_assistant.documents import DocumentChunk
 
 DEFAULT_EMBEDDING_MODEL = "sentence-transformers/all-MiniLM-L6-v2"
 _MODEL_CACHE: dict[str, Any] = {}
+_INDEX_CACHE: dict[tuple[str, tuple[tuple[str, str], ...]], dict[str, Any]] = {}
 
 
 @dataclass(frozen=True)
@@ -45,17 +46,30 @@ class InMemoryECURetriever:
 
         self.np = np
         self.model_name = model_name or env("LOCAL_EMBEDDING_MODEL", DEFAULT_EMBEDDING_MODEL)
-        self.model = _load_sentence_transformer(self.model_name, SentenceTransformer)
-        embeddings = self.model.encode(
-            [chunk.content for chunk in self.chunks],
-            normalize_embeddings=True,
-            show_progress_bar=False,
-        )
-        matrix = np.asarray(embeddings, dtype="float32")
-        self.index = faiss.IndexFlatIP(matrix.shape[1])
-        self.index.add(matrix)
-        self.tokenized_chunks = [_tokenize(chunk.content) for chunk in self.chunks]
-        self.bm25 = BM25Okapi(self.tokenized_chunks)
+        cache_key = _index_cache_key(self.model_name, self.chunks)
+        cached = _INDEX_CACHE.get(cache_key)
+        if cached is None:
+            self.model = _load_sentence_transformer(self.model_name, SentenceTransformer)
+            embeddings = self.model.encode(
+                [chunk.content for chunk in self.chunks],
+                normalize_embeddings=True,
+                show_progress_bar=False,
+            )
+            matrix = np.asarray(embeddings, dtype="float32")
+            index = faiss.IndexFlatIP(matrix.shape[1])
+            index.add(matrix)
+            cached = {
+                "model": self.model,
+                "index": index,
+                "tokenized_chunks": [_tokenize(chunk.content) for chunk in self.chunks],
+            }
+            cached["bm25"] = BM25Okapi(cached["tokenized_chunks"])
+            _INDEX_CACHE[cache_key] = cached
+
+        self.model = cached["model"]
+        self.index = cached["index"]
+        self.tokenized_chunks = cached["tokenized_chunks"]
+        self.bm25 = cached["bm25"]
 
     def retrieve(
         self,
@@ -130,6 +144,10 @@ def _load_sentence_transformer(model_name: str, model_class):
     if model_name not in _MODEL_CACHE:
         _MODEL_CACHE[model_name] = model_class(model_name)
     return _MODEL_CACHE[model_name]
+
+
+def _index_cache_key(model_name: str, chunks: Sequence[DocumentChunk]) -> tuple[str, tuple[tuple[str, str], ...]]:
+    return model_name, tuple((chunk.chunk_id, chunk.content) for chunk in chunks)
 
 
 def _filter_values(value: Sequence[str] | str | None) -> list[str]:
