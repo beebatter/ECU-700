@@ -17,3 +17,4 @@ build/
 dist/
 *.egg-info/
 .databricks/
+qa_eval_reports/
